@@ -78,15 +78,9 @@ If the UI says:
 Diarization fallback: optional_dependency_missing
 ```
 
-that means the deployed container does not have optional diarization packages installed. `HF_TOKEN` alone is not enough; the image also needs `torch`, `torchaudio`, `resemblyzer`, and `pyannote.audio` from `requirements-diarization.txt`.
+that means the deployed container does not have optional diarization packages installed. The Dockerfile now installs `requirements-diarization.txt` by default, so push the latest Dockerfile and redeploy.
 
-In Render, add this Docker build argument:
-
-```text
-INSTALL_DIARIZATION=true
-```
-
-Also set this environment variable:
+Then set this environment variable:
 
 ```text
 HF_TOKEN=your_hugging_face_token
@@ -113,7 +107,7 @@ huggingface_token_missing
   HF_TOKEN is not set.
 
 optional_dependency_missing
-  pyannote/resemblyzer dependencies are not installed in the container.
+  pyannote/resemblyzer dependencies are not installed in the container. Push the latest Dockerfile and redeploy.
 
 pipeline_unavailable
   Token exists, but model access/terms are not accepted or the pipeline failed to load.
