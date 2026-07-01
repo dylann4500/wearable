@@ -70,6 +70,60 @@ HF_TOKEN=your_hugging_face_token
 
 Use `tiny.en` first for faster CPU testing. Move to `base.en` or better once the deploy works.
 
+## Enable Pyannote Diarization on Render
+
+If the UI says:
+
+```text
+Diarization fallback: optional_dependency_missing
+```
+
+that means the deployed container does not have optional diarization packages installed. `HF_TOKEN` alone is not enough; the image also needs `torch`, `torchaudio`, `resemblyzer`, and `pyannote.audio` from `requirements-diarization.txt`.
+
+In Render, add this Docker build argument:
+
+```text
+INSTALL_DIARIZATION=true
+```
+
+Also set this environment variable:
+
+```text
+HF_TOKEN=your_hugging_face_token
+```
+
+Before using the token, make sure the Hugging Face account has accepted the terms for:
+
+```text
+pyannote/speaker-diarization-3.1
+```
+
+Then trigger a manual redeploy.
+
+Expected successful status after analysis:
+
+```text
+pyannote.audio: N speakers
+```
+
+Other statuses:
+
+```text
+huggingface_token_missing
+  HF_TOKEN is not set.
+
+optional_dependency_missing
+  pyannote/resemblyzer dependencies are not installed in the container.
+
+pipeline_unavailable
+  Token exists, but model access/terms are not accepted or the pipeline failed to load.
+
+pipeline_failed
+  Dependencies are installed, but pyannote failed at runtime. Check Render logs.
+```
+
+Warning: installing pyannote and torch makes the Docker image much larger and may increase cold start/build time. It may also make CPU analysis slower. This is normal for this MVP.
+
 ## Health Check
 
 After deploy, open:

@@ -18,8 +18,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+COPY requirements-diarization.txt .
+ARG INSTALL_DIARIZATION=false
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    && if [ "$INSTALL_DIARIZATION" = "true" ]; then pip install --no-cache-dir -r requirements-diarization.txt; fi
 
 COPY app ./app
 
