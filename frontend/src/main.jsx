@@ -236,21 +236,31 @@ function RecordingState({ recording }) {
 }
 
 function Results({ data }) {
+  const metadata = data.metadata || {};
+  const summary = data.summary || {};
+  const speakers = data.speakers || {};
+  const turnTaking = data.turn_taking || {};
+  const language = data.language || {};
+  const pauses = data.silence_and_pauses || {};
+  const audioQuality = data.audio_quality || {};
+  const sentiment = data.sentiment || {};
+  const interjections = data.interjections || { events: [], estimated_count: 0 };
+  const transcript = data.transcript || [];
   const summaryValues = {
-    ...data.summary,
-    interjections: data.interjections.estimated_count,
-    fillers_per_minute: data.language.fillers_per_minute,
-    question_count: data.language.question_count,
+    ...summary,
+    interjections: interjections.estimated_count,
+    fillers_per_minute: language.fillers_per_minute,
+    question_count: language.question_count,
   };
 
   return (
     <div className="results">
       <header className="resultHeader">
         <div>
-          <p className="eyebrow">{data.metadata.file_name}</p>
-          <h2>{Math.round(data.summary.duration_seconds)} second conversation</h2>
+          <p className="eyebrow">{metadata.file_name || "Recording"}</p>
+          <h2>{Math.round(summary.duration_seconds || metadata.duration_seconds || 0)} second conversation</h2>
         </div>
-        <div className="badge">{diarizationLabel(data.metadata.diarization)}</div>
+        <div className="badge">{diarizationLabel(metadata.diarization)}</div>
       </header>
 
       <section className="cardGrid">
@@ -266,63 +276,63 @@ function Results({ data }) {
       </section>
 
       <Panel title="Speaker Breakdown">
-        <SpeakerTable speakers={data.speakers} />
+        <SpeakerTable speakers={speakers} />
       </Panel>
 
       <section className="metricGrid">
         <MetricPanel icon={Clock3} title="Turn Taking" values={{
-          "Total turns": data.turn_taking.turn_count,
-          "Average turn": sec(data.turn_taking.average_turn_seconds),
-          "Median turn": sec(data.turn_taking.median_turn_seconds),
-          "Longest turn": sec(data.turn_taking.longest_turn_seconds),
-          "Very short responses": data.turn_taking.very_short_responses,
-          "Monologues over 45s": data.turn_taking.monologues_over_45s,
-          "Avg response latency": sec(data.turn_taking.average_response_latency_seconds),
-          "Fast responses under 300ms": data.turn_taking.fast_responses_under_300ms,
+          "Total turns": turnTaking.turn_count,
+          "Average turn": sec(turnTaking.average_turn_seconds),
+          "Median turn": sec(turnTaking.median_turn_seconds),
+          "Longest turn": sec(turnTaking.longest_turn_seconds),
+          "Very short responses": turnTaking.very_short_responses,
+          "Monologues over 45s": turnTaking.monologues_over_45s,
+          "Avg response latency": sec(turnTaking.average_response_latency_seconds),
+          "Fast responses under 300ms": turnTaking.fast_responses_under_300ms,
         }} />
         <MetricPanel icon={MessageSquareQuote} title="Language" values={{
-          "Filler words": data.language.filler_words_total,
-          "Fillers per minute": data.language.fillers_per_minute,
-          "Questions": data.language.question_count,
-          "Follow-up estimate": data.language.follow_up_question_estimate,
-          "Backchannels": data.language.backchannel_count,
-          "Validation phrases": data.language.validation_phrase_count,
-          "Advice phrases": data.language.advice_phrase_count,
-          "Type-token ratio": data.language.lexical_diversity_type_token_ratio,
+          "Filler words": language.filler_words_total,
+          "Fillers per minute": language.fillers_per_minute,
+          "Questions": language.question_count,
+          "Follow-up estimate": language.follow_up_question_estimate,
+          "Backchannels": language.backchannel_count,
+          "Validation phrases": language.validation_phrase_count,
+          "Advice phrases": language.advice_phrase_count,
+          "Type-token ratio": language.lexical_diversity_type_token_ratio,
         }} />
         <MetricPanel icon={Pause} title="Pauses" values={{
-          "Total silence": sec(data.silence_and_pauses.total_silence_seconds),
-          "Silence share": pct(data.summary.silence_percent),
-          "Avg between-turn pause": sec(data.silence_and_pauses.average_between_turn_pause_seconds),
-          "Long pauses over 2s": data.silence_and_pauses.long_pauses_over_2s,
-          "Intra-speech pauses >500ms": data.silence_and_pauses.intra_speech_pauses_over_500ms,
+          "Total silence": sec(pauses.total_silence_seconds),
+          "Silence share": pct(summary.silence_percent),
+          "Avg between-turn pause": sec(pauses.average_between_turn_pause_seconds),
+          "Long pauses over 2s": pauses.long_pauses_over_2s,
+          "Intra-speech pauses >500ms": pauses.intra_speech_pauses_over_500ms,
         }} />
         <MetricPanel icon={Volume2} title="Audio Quality" values={{
-          "Average volume": db(data.audio_quality.average_volume_db),
-          "Dynamic range": db(data.audio_quality.dynamic_range_db),
-          "Pitch range": hz(data.audio_quality.pitch_range_hz),
-          "Pitch variability": hz(data.audio_quality.pitch_variability_hz),
-          "Confidence": data.audio_quality.audio_quality_confidence,
+          "Average volume": db(audioQuality.average_volume_db),
+          "Dynamic range": db(audioQuality.dynamic_range_db),
+          "Pitch range": hz(audioQuality.pitch_range_hz),
+          "Pitch variability": hz(audioQuality.pitch_variability_hz),
+          "Confidence": audioQuality.audio_quality_confidence,
         }} />
       </section>
 
       <section className="metricGrid">
         <Panel title="Sentiment">
           <KeyValues values={{
-            "Average": data.sentiment.average,
-            "Most negative": data.sentiment.minimum,
-            "Most positive": data.sentiment.maximum,
-            "Ending average": data.sentiment.ending_average_last_3_turns,
-            "Largest shift": data.sentiment.largest_shift,
+            "Average": sentiment.average,
+            "Most negative": sentiment.minimum,
+            "Most positive": sentiment.maximum,
+            "Ending average": sentiment.ending_average_last_3_turns,
+            "Largest shift": sentiment.largest_shift,
           }} />
         </Panel>
         <Panel title="Interjections">
-          <p className="panelNote">{data.interjections.note}</p>
-          {data.interjections.events.length === 0 ? (
+          <p className="panelNote">{interjections.note || "No interjection events available."}</p>
+          {(interjections.events || []).length === 0 ? (
             <KeyValues values={{ "Estimated count": 0 }} />
           ) : (
             <div className="eventList">
-              {data.interjections.events.map((event, index) => (
+              {interjections.events.map((event, index) => (
                 <div className="event" key={`${event.time}-${index}`}>
                   <strong>{event.speaker}</strong> at {event.time}s
                   <span>{event.type}: "{event.text}"</span>
@@ -335,7 +345,9 @@ function Results({ data }) {
 
       <Panel title="Transcript">
         <div className="transcript">
-          {data.transcript.map((turn, index) => (
+          {transcript.length === 0 ? (
+            <p className="panelNote">No transcript turns available for this recording.</p>
+          ) : transcript.map((turn, index) => (
             <article className="turn" key={`${turn.start}-${index}`}>
               <div className="turnMeta">
                 <strong>{turn.speaker}</strong>
