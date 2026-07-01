@@ -57,6 +57,7 @@ Set these in Render:
 
 ```text
 DEVICE_UPLOAD_TOKEN=choose-a-long-random-secret
+CORS_ALLOW_ORIGINS=https://your-vercel-app.vercel.app
 WHISPER_MODEL=tiny.en
 WHISPER_DEVICE=cpu
 WHISPER_COMPUTE_TYPE=int8
@@ -150,6 +151,12 @@ VITE_API_BASE_URL=https://your-render-service.onrender.com
 ```
 
 Redeploy the Vercel app.
+
+In Render, make sure `CORS_ALLOW_ORIGINS` is set to the exact Vercel origin, without a trailing slash:
+
+```text
+CORS_ALLOW_ORIGINS=https://your-vercel-app.vercel.app
+```
 
 ## Connect Wearable
 

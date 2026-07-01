@@ -25,10 +25,16 @@ from app.recordings import (
 app = FastAPI(title="Conversation Analytics MVP")
 init_db()
 
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOW_ORIGINS", os.getenv("FRONTEND_URL", "*")).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
