@@ -10,6 +10,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 import app.recordings as recordings
+import app.analyzer as analyzer
 from app.main import app
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -144,6 +145,23 @@ class FirmwareHandoffTest(unittest.TestCase):
             "DEVICE_UPLOAD_TOKEN",
         ):
             self.assertIn(name, example)
+
+
+class AnalyzerConfigTest(unittest.TestCase):
+    def test_diarization_can_be_disabled_for_low_memory_hosts(self) -> None:
+        previous = os.environ.get("DIARIZATION_MODE")
+        os.environ["DIARIZATION_MODE"] = "off"
+        try:
+            segments, status = analyzer.diarize_audio(Path("unused.wav"))
+        finally:
+            if previous is None:
+                os.environ.pop("DIARIZATION_MODE", None)
+            else:
+                os.environ["DIARIZATION_MODE"] = previous
+
+        self.assertEqual(segments, [])
+        self.assertEqual(status["status"], "disabled")
+        self.assertEqual(status["speaker_count"], 1)
 
 
 if __name__ == "__main__":

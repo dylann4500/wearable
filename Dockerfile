@@ -9,7 +9,8 @@ ENV PYTHONUNBUFFERED=1 \
     RECORDINGS_DB=/var/data/recordings.sqlite3 \
     WHISPER_MODEL=tiny.en \
     WHISPER_DEVICE=cpu \
-    WHISPER_COMPUTE_TYPE=int8
+    WHISPER_COMPUTE_TYPE=int8 \
+    DIARIZATION_MODE=off
 
 WORKDIR /app
 
@@ -18,10 +19,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-COPY requirements-diarization.txt .
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir -r requirements-diarization.txt
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 

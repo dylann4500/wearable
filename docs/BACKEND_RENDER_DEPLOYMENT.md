@@ -61,6 +61,7 @@ CORS_ALLOW_ORIGINS=https://your-vercel-app.vercel.app
 WHISPER_MODEL=tiny.en
 WHISPER_DEVICE=cpu
 WHISPER_COMPUTE_TYPE=int8
+DIARIZATION_MODE=off
 ```
 
 Optional:
@@ -71,6 +72,14 @@ HF_TOKEN=your_hugging_face_token
 
 Use `tiny.en` first for faster CPU testing. Move to `base.en` or better once the deploy works.
 
+For a 512 MB Render instance, keep:
+
+```text
+DIARIZATION_MODE=off
+```
+
+This disables pyannote and resemblyzer so the hosted backend can survive low memory. It still transcribes and computes non-speaker-dependent metrics, but speaker labels will be `Speaker 1`.
+
 ## Enable Pyannote Diarization on Render
 
 If the UI says:
@@ -79,7 +88,9 @@ If the UI says:
 Diarization fallback: optional_dependency_missing
 ```
 
-that means the deployed container does not have optional diarization packages installed. The Dockerfile now installs `requirements-diarization.txt` by default, so push the latest Dockerfile and redeploy.
+that means the deployed container does not have optional diarization packages installed. The default Dockerfile is intentionally lightweight for low-memory Render instances.
+
+To enable pyannote or resemblyzer, you need a larger instance and a Dockerfile that installs `requirements-diarization.txt`.
 
 Then set this environment variable:
 
@@ -118,6 +129,18 @@ pipeline_failed
 ```
 
 Warning: installing pyannote and torch makes the Docker image much larger and may increase cold start/build time. It may also make CPU analysis slower. This is normal for this MVP.
+
+For low-memory hosted testing, use:
+
+```text
+DIARIZATION_MODE=off
+```
+
+For local testing or a larger Render instance, use:
+
+```text
+DIARIZATION_MODE=auto
+```
 
 If Render shows:
 

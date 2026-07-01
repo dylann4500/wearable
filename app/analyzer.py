@@ -124,7 +124,7 @@ def analyze_audio(input_path: Path, original_name: str) -> dict[str, Any]:
     transcript_segments = transcribe(wav_path)
     diarization_segments, diarization_status = diarize_audio(wav_path)
     turns = build_turns(transcript_segments, diarization_segments)
-    if not diarization_segments:
+    if not diarization_segments and diarization_mode() != "off":
         pyannote_status = diarization_status
         diarization_status = assign_speakers(wav_path, turns)
         diarization_status["fallback_reason"] = pyannote_status
@@ -143,6 +143,17 @@ def analyze_audio(input_path: Path, original_name: str) -> dict[str, Any]:
     }
 
     return metrics
+
+
+def diarization_mode() -> str:
+    mode = os.getenv("DIARIZATION_MODE", "auto").strip().lower()
+    if mode in {"off", "none", "disabled", "0", "false", "no"}:
+        return "off"
+    if mode in {"pyannote", "timeline"}:
+        return "pyannote"
+    if mode in {"fallback", "resemblyzer", "local"}:
+        return "fallback"
+    return "auto"
 
 
 def convert_to_wav(input_path: Path, wav_path: Path) -> None:
@@ -272,6 +283,22 @@ def merge_tiny_turns(turns: list[Turn]) -> list[Turn]:
 
 def diarize_audio(wav_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return a speaker timeline when a stronger diarization backend is configured."""
+    mode = diarization_mode()
+    if mode == "off":
+        return [], {
+            "enabled": False,
+            "backend": "disabled",
+            "status": "disabled",
+            "detail": "Set DIARIZATION_MODE=auto, fallback, or pyannote to enable speaker diarization.",
+            "speaker_count": 1,
+        }
+    if mode == "fallback":
+        return [], {
+            "enabled": False,
+            "backend": "resemblyzer",
+            "status": "fallback_requested",
+            "detail": "Skipping pyannote and using local speaker embedding fallback.",
+        }
     segments, status = diarize_with_pyannote(wav_path)
     if segments:
         return segments, status
