@@ -14,6 +14,12 @@ For the quickest public backend deployment to pair with the Vercel frontend, rea
 docs/BACKEND_RENDER_DEPLOYMENT.md
 ```
 
+For the deployed Vercel + Render + XIAO hardware test workflow, read:
+
+```text
+docs/XIAO_DEPLOYED_PLATFORM_TEST_RUNBOOK.md
+```
+
 ## What It Does
 
 - Upload an MP3 or other audio file.

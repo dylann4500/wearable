@@ -18,6 +18,7 @@
 #include <SPI.h> //enables SPI communication
 #include <ESP_I2S.h> //enables I2S protocol to talk to the MEMS mic
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include "firmware_config.h"
 
@@ -254,10 +255,19 @@ bool uploadAudioFile(String audioFileName) {
   Serial.printf("Uploading %s (%u bytes) to %s\n", audioFileName.c_str(), (unsigned int)file.size(), url.c_str());
 
   WiFiClient client;
+  WiFiClientSecure secureClient;
   HTTPClient http;
   http.setTimeout(30000);
 
-  if (!http.begin(client, url)) {
+  bool isHttps = url.startsWith("https://");
+  if (isHttps) {
+    // MVP/testing shortcut: skip certificate validation for hosted HTTPS APIs.
+    // Production firmware should pin the server certificate or CA instead.
+    secureClient.setInsecure();
+  }
+
+  bool httpStarted = isHttps ? http.begin(secureClient, url) : http.begin(client, url);
+  if (!httpStarted) {
     Serial.println("HTTP begin failed.");
     file.close();
     return false;
