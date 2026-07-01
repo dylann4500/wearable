@@ -35,6 +35,19 @@ const cards = [
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 const apiUrl = (path) => `${API_BASE_URL}${path}`;
 
+async function fetchJson(path, options) {
+  const response = await fetch(apiUrl(path), options);
+  const contentType = response.headers.get("content-type") || "";
+  const payload = contentType.includes("application/json") ? await response.json() : null;
+  if (!payload) {
+    throw new Error("Backend API did not return JSON.");
+  }
+  if (!response.ok) {
+    throw new Error(payload?.detail || `API request failed with status ${response.status}.`);
+  }
+  return payload;
+}
+
 function App() {
   const [file, setFile] = useState(null);
   const [recordings, setRecordings] = useState([]);
@@ -73,13 +86,11 @@ function App() {
   async function refreshRecordings(options = {}) {
     if (!options.quiet) setIsRefreshing(true);
     try {
-      const response = await fetch(apiUrl("/api/recordings"));
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail || "Could not load recordings.");
+      const payload = await fetchJson("/api/recordings");
       setRecordings(payload);
       if (!selectedId && payload.length > 0) setSelectedId(payload[0].id);
     } catch (error) {
-      if (!options.quiet) setStatus(error.message);
+      if (!options.quiet) setStatus(apiErrorMessage(error));
     } finally {
       if (!options.quiet) setIsRefreshing(false);
     }
@@ -87,12 +98,10 @@ function App() {
 
   async function refreshRecording(id, options = {}) {
     try {
-      const response = await fetch(apiUrl(`/api/recordings/${id}`));
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail || "Could not load recording.");
+      const payload = await fetchJson(`/api/recordings/${id}`);
       setSelectedRecording(payload);
     } catch (error) {
-      if (!options.quiet) setStatus(error.message);
+      if (!options.quiet) setStatus(apiErrorMessage(error));
     }
   }
 
@@ -105,16 +114,14 @@ function App() {
     try {
       const body = new FormData();
       body.append("file", file);
-      const response = await fetch(apiUrl("/api/recordings"), { method: "POST", body });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail || "Upload failed.");
+      const payload = await fetchJson("/api/recordings", { method: "POST", body });
       setSelectedId(payload.id);
       setSelectedRecording(payload);
       setFile(null);
       await refreshRecordings({ quiet: true });
       setStatus("Recording uploaded. Analysis is running in the background.");
     } catch (error) {
-      setStatus(error.message);
+      setStatus(apiErrorMessage(error));
     } finally {
       setIsUploading(false);
     }
@@ -442,6 +449,13 @@ function sourceIcon(source) {
 function formatDate(value) {
   if (!value) return "n/a";
   return new Date(value).toLocaleString();
+}
+
+function apiErrorMessage(error) {
+  if (!API_BASE_URL && window.location.hostname.includes("vercel.app")) {
+    return "Frontend is deployed, but no backend API is connected yet. Set VITE_API_BASE_URL in Vercel after deploying the backend.";
+  }
+  return error.message;
 }
 
 const sec = (value) => format(value, "s");
