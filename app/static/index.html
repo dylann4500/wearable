@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Conversation Analytics MVP</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <aside class="upload-panel">
+          <div>
+            <p class="eyebrow">Wearable speech analytics</p>
+            <h1>Conversation analyzer</h1>
+          </div>
+
+          <form id="uploadForm" class="upload-box">
+            <label for="audioFile">Audio file</label>
+            <input id="audioFile" name="file" type="file" accept="audio/*,.mp3" required />
+            <button type="submit">
+              <span aria-hidden="true">↑</span>
+              Analyze MP3
+            </button>
+          </form>
+
+          <div id="status" class="status">Ready for an MP3 conversation.</div>
+
+          <div class="notes">
+            <h2>Current scope</h2>
+            <p>
+              This MVP extracts practical metrics using transcription, acoustic features,
+              turn timing, phrase rules, sentiment scoring, and optional local diarization.
+            </p>
+          </div>
+        </aside>
+
+        <section class="results-panel">
+          <div id="emptyState" class="empty-state">
+            <h2>Upload a conversation to see metrics.</h2>
+            <p>Results will appear as summary cards, speaker analytics, interjection estimates, and transcript turns.</p>
+          </div>
+
+          <div id="results" class="results hidden">
+            <div class="result-header">
+              <div>
+                <p class="eyebrow" id="fileName">Analysis</p>
+                <h2 id="headline">Conversation metrics</h2>
+              </div>
+              <div class="pill" id="diarizationStatus">Diarization</div>
+            </div>
+
+            <div id="summaryCards" class="card-grid"></div>
+
+            <section class="band">
+              <h3>Speaker Breakdown</h3>
+              <div id="speakerTable" class="table-wrap"></div>
+            </section>
+
+            <section class="metric-grid">
+              <div class="metric-section">
+                <h3>Turn Taking</h3>
+                <div id="turnTaking"></div>
+              </div>
+              <div class="metric-section">
+                <h3>Language</h3>
+                <div id="language"></div>
+              </div>
+              <div class="metric-section">
+                <h3>Pauses</h3>
+                <div id="pauses"></div>
+              </div>
+              <div class="metric-section">
+                <h3>Sentiment</h3>
+                <div id="sentiment"></div>
+              </div>
+              <div class="metric-section">
+                <h3>Interjections</h3>
+                <div id="interjections"></div>
+              </div>
+              <div class="metric-section">
+                <h3>Audio Quality</h3>
+                <div id="audioQuality"></div>
+              </div>
+            </section>
+
+            <section class="band">
+              <h3>Transcript</h3>
+              <div id="transcript" class="transcript"></div>
+            </section>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
+

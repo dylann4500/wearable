@@ -1,0 +1,6 @@
+-r requirements.txt
+torch==2.5.1
+torchaudio==2.5.1
+huggingface_hub==0.24.7
+resemblyzer==0.1.4
+pyannote.audio==3.1.1
