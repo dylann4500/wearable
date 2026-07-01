@@ -127,6 +127,89 @@ h3 {
   font-size: 0.92rem;
 }
 
+.recordingList {
+  display: grid;
+  gap: 10px;
+}
+
+.sectionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sectionHeader h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.sectionHeader button {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--teal);
+  cursor: pointer;
+}
+
+.sectionHeader button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.smallNote {
+  margin-bottom: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+
+.recordingButtons {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.recordingButton {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+  text-align: left;
+}
+
+.recordingButton.active {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+}
+
+.recordingButton span,
+.recordingButton strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recordingButton span {
+  font-size: 0.88rem;
+}
+
+.recordingButton strong {
+  color: var(--teal);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
+
 .sideNote {
   margin-top: auto;
   color: var(--muted);
@@ -161,6 +244,32 @@ h3 {
 
 .empty h2 {
   color: var(--ink);
+}
+
+.jobState {
+  display: grid;
+  gap: 14px;
+  max-width: 620px;
+  margin: 0 auto;
+  padding-top: 18vh;
+}
+
+.jobState > svg {
+  color: var(--teal);
+}
+
+.jobState h2 {
+  margin-bottom: 4px;
+}
+
+.spin {
+  animation: spin 1.2s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .results {
@@ -376,4 +485,3 @@ th {
     grid-template-columns: 1fr;
   }
 }
-

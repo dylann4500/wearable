@@ -4,6 +4,11 @@ __pycache__/
 .DS_Store
 uploads/
 analysis_runs/
+recording_results/
+recordings.sqlite3
+firmware/xiao-esp32s3-prototype/firmware_config.h
+.platformio/
+.pio/
 node_modules/
 frontend/node_modules/
 frontend/dist/

@@ -1,8 +1,9 @@
 {
   "scripts": {
     "build": "npm --prefix frontend run build",
+    "build:firmware": "node scripts/build_firmware.js",
     "dev": "npm --prefix frontend run dev",
-    "install:frontend": "npm --prefix frontend install"
+    "install:frontend": "npm --prefix frontend install",
+    "test": "node scripts/test.js"
   }
 }
-

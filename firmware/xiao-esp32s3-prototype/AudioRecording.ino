@@ -17,6 +17,9 @@
 #include <SD.h> //this is the SD card library
 #include <SPI.h> //enables SPI communication
 #include <ESP_I2S.h> //enables I2S protocol to talk to the MEMS mic
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "firmware_config.h"
 
 // -------------------- I2S object --------------------
 
@@ -44,6 +47,8 @@ const int I2S_PDM_DATA_PIN = 41;
 // -------------------- File settings --------------------
 
 const char *AUDIO_DIR = "/Audio";
+
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 
 // -------------------- Recording state --------------------
 
@@ -154,6 +159,169 @@ String getNextAudioFileName() {
 
     fileNumber++;
   }
+}
+
+bool hasSuffix(String value, const char *suffix) {
+  return value.endsWith(suffix);
+}
+
+String baseName(String path) {
+  int slashIndex = path.lastIndexOf('/');
+  if (slashIndex >= 0) {
+    return path.substring(slashIndex + 1);
+  }
+  return path;
+}
+
+String normalizeAudioPath(String path) {
+  if (path.startsWith("/")) {
+    return path;
+  }
+  return String(AUDIO_DIR) + "/" + path;
+}
+
+String uploadedMarkerName(String audioFileName) {
+  return String(audioFileName) + ".uploaded";
+}
+
+String urlEncode(String value) {
+  String encoded = "";
+  const char *hex = "0123456789ABCDEF";
+
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value.charAt(i);
+    bool safe =
+      (c >= 'a' && c <= 'z') ||
+      (c >= 'A' && c <= 'Z') ||
+      (c >= '0' && c <= '9') ||
+      c == '-' ||
+      c == '_' ||
+      c == '.' ||
+      c == '~';
+
+    if (safe) {
+      encoded += c;
+    } else {
+      encoded += '%';
+      encoded += hex[(c >> 4) & 0x0F];
+      encoded += hex[c & 0x0F];
+    }
+  }
+
+  return encoded;
+}
+
+bool connectToWiFiIfNeeded() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+
+  Serial.printf("Connecting to Wi-Fi SSID: %s\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi connection failed. Upload will be retried later.");
+    return false;
+  }
+
+  Serial.print("Wi-Fi connected. Device IP: ");
+  Serial.println(WiFi.localIP());
+  return true;
+}
+
+bool uploadAudioFile(String audioFileName) {
+  if (!connectToWiFiIfNeeded()) {
+    return false;
+  }
+
+  File file = SD.open(audioFileName, FILE_READ);
+  if (!file) {
+    Serial.printf("Failed to open %s for upload.\n", audioFileName.c_str());
+    return false;
+  }
+
+  String filename = baseName(audioFileName);
+  String url = String(SERVER_BASE_URL) + "/api/device/recordings/raw?filename=" + urlEncode(filename);
+
+  Serial.printf("Uploading %s (%u bytes) to %s\n", audioFileName.c_str(), (unsigned int)file.size(), url.c_str());
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(30000);
+
+  if (!http.begin(client, url)) {
+    Serial.println("HTTP begin failed.");
+    file.close();
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/octet-stream");
+  http.addHeader("X-Device-Id", DEVICE_ID);
+  http.addHeader("X-Device-Token", DEVICE_UPLOAD_TOKEN);
+
+  int statusCode = http.sendRequest("POST", &file, file.size());
+  String response = http.getString();
+
+  http.end();
+  file.close();
+
+  Serial.printf("Upload response status: %d\n", statusCode);
+  Serial.println(response);
+
+  if (statusCode < 200 || statusCode >= 300) {
+    Serial.println("Upload failed. File will be retried later.");
+    return false;
+  }
+
+  String marker = uploadedMarkerName(audioFileName);
+  File markerFile = SD.open(marker, FILE_WRITE);
+  if (markerFile) {
+    markerFile.println("uploaded");
+    markerFile.close();
+  }
+
+  Serial.printf("Upload complete. Marker written: %s\n", marker.c_str());
+  return true;
+}
+
+void uploadPendingAudioFiles() {
+  File dir = SD.open(AUDIO_DIR);
+  if (!dir || !dir.isDirectory()) {
+    Serial.println("Cannot scan /Audio for pending uploads.");
+    return;
+  }
+
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      break;
+    }
+
+    String audioFileName = normalizeAudioPath(String(entry.name()));
+    bool isDirectory = entry.isDirectory();
+    entry.close();
+
+    if (isDirectory || !hasSuffix(audioFileName, ".wav")) {
+      continue;
+    }
+
+    String marker = uploadedMarkerName(audioFileName);
+    if (SD.exists(marker)) {
+      continue;
+    }
+
+    uploadAudioFile(audioFileName);
+  }
+
+  dir.close();
 }
 
 // -------------------- Audio helper --------------------
@@ -332,6 +500,8 @@ void setup() {
     }
   }
 
+  uploadPendingAudioFiles();
+
   Serial.println("Ready.");
   Serial.println("Press and hold the button on D0 to record.");
 }
@@ -346,6 +516,8 @@ void loop() {
       String audioFileName = getNextAudioFileName();
 
       recordWhileButtonHeld(audioFileName.c_str());
+
+      uploadAudioFile(audioFileName);
 
       delay(200); // prevent accidental double-trigger
 

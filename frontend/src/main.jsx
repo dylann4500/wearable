@@ -1,18 +1,23 @@
-import React, { useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
   AudioLines,
   Brain,
+  CheckCircle2,
   Clock3,
+  HardDriveUpload,
+  LoaderCircle,
   MessageSquareQuote,
   Mic2,
   Pause,
   Radio,
+  RefreshCw,
   Sparkles,
   Upload,
   Users,
   Volume2,
+  XCircle,
 } from "lucide-react";
 import "./styles.css";
 
@@ -27,30 +32,91 @@ const cards = [
   ["Questions", "question_count", Sparkles],
 ];
 
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+const apiUrl = (path) => `${API_BASE_URL}${path}`;
+
 function App() {
   const [file, setFile] = useState(null);
-  const [result, setResult] = useState(null);
-  const [status, setStatus] = useState("Ready for an MP3 conversation.");
-  const [isLoading, setIsLoading] = useState(false);
+  const [recordings, setRecordings] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
+  const [selectedRecording, setSelectedRecording] = useState(null);
+  const [status, setStatus] = useState("Ready for a wearable or browser recording.");
+  const [isUploading, setIsUploading] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  const hasActiveJob = useMemo(
+    () => recordings.some((recording) => ["uploaded", "processing"].includes(recording.status)),
+    [recordings],
+  );
+
+  useEffect(() => {
+    refreshRecordings();
+  }, []);
+
+  useEffect(() => {
+    if (!selectedId) {
+      setSelectedRecording(null);
+      return;
+    }
+    refreshRecording(selectedId);
+  }, [selectedId]);
+
+  useEffect(() => {
+    if (!hasActiveJob && !selectedId) return;
+    const interval = window.setInterval(() => {
+      refreshRecordings({ quiet: true });
+      if (selectedId) refreshRecording(selectedId, { quiet: true });
+    }, 2500);
+    return () => window.clearInterval(interval);
+  }, [hasActiveJob, selectedId]);
+
+  async function refreshRecordings(options = {}) {
+    if (!options.quiet) setIsRefreshing(true);
+    try {
+      const response = await fetch(apiUrl("/api/recordings"));
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "Could not load recordings.");
+      setRecordings(payload);
+      if (!selectedId && payload.length > 0) setSelectedId(payload[0].id);
+    } catch (error) {
+      if (!options.quiet) setStatus(error.message);
+    } finally {
+      if (!options.quiet) setIsRefreshing(false);
+    }
+  }
+
+  async function refreshRecording(id, options = {}) {
+    try {
+      const response = await fetch(apiUrl(`/api/recordings/${id}`));
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "Could not load recording.");
+      setSelectedRecording(payload);
+    } catch (error) {
+      if (!options.quiet) setStatus(error.message);
+    }
+  }
 
   async function analyze(event) {
     event.preventDefault();
     if (!file) return;
-    setIsLoading(true);
-    setStatus("Analyzing audio. Longer conversations can take a few minutes.");
+    setIsUploading(true);
+    setStatus("Uploading recording and starting analysis.");
 
     try {
       const body = new FormData();
       body.append("file", file);
-      const response = await fetch("/api/analyze", { method: "POST", body });
+      const response = await fetch(apiUrl("/api/recordings"), { method: "POST", body });
       const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail || "Analysis failed.");
-      setResult(payload);
-      setStatus("Analysis complete.");
+      if (!response.ok) throw new Error(payload.detail || "Upload failed.");
+      setSelectedId(payload.id);
+      setSelectedRecording(payload);
+      setFile(null);
+      await refreshRecordings({ quiet: true });
+      setStatus("Recording uploaded. Analysis is running in the background.");
     } catch (error) {
       setStatus(error.message);
     } finally {
-      setIsLoading(false);
+      setIsUploading(false);
     }
   }
 
@@ -63,33 +129,65 @@ function App() {
         </div>
 
         <form className="uploadBox" onSubmit={analyze}>
-          <label htmlFor="audioFile">Audio file</label>
+          <label htmlFor="audioFile">Browser test upload</label>
           <input
             id="audioFile"
             type="file"
             accept="audio/*,.mp3"
             onChange={(event) => setFile(event.target.files?.[0] || null)}
           />
-          <button type="submit" disabled={!file || isLoading}>
+          <button type="submit" disabled={!file || isUploading}>
             <Upload size={18} />
-            Analyze audio
+            Upload recording
           </button>
         </form>
 
         <div className="status">{status}</div>
 
+        <section className="recordingList">
+          <div className="sectionHeader">
+            <h2>Recordings</h2>
+            <button type="button" onClick={() => refreshRecordings()} disabled={isRefreshing} aria-label="Refresh recordings">
+              <RefreshCw size={16} />
+            </button>
+          </div>
+          {recordings.length === 0 ? (
+            <p className="smallNote">Wearable uploads and browser test uploads will appear here.</p>
+          ) : (
+            <div className="recordingButtons">
+              {recordings.map((recording) => (
+                <button
+                  type="button"
+                  className={recording.id === selectedId ? "recordingButton active" : "recordingButton"}
+                  key={recording.id}
+                  onClick={() => setSelectedId(recording.id)}
+                >
+                  <span>{sourceIcon(recording.source)} {recording.original_filename}</span>
+                  <strong>{statusLabel(recording.status)}</strong>
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
+
         <section className="sideNote">
-          <h2>Diarization Upgrade</h2>
+          <h2>Wearable MVP</h2>
           <p>
-            The backend now prefers pyannote.audio timeline diarization when configured,
-            then maps Whisper words to that speaker timeline. The local embedding
-            fallback remains available with extra smoothing for isolated speaker flips.
+            The XIAO can upload finished SD-card recordings to the new device endpoint.
+            This screen follows each upload from arrival through processing to completed
+            metrics.
           </p>
         </section>
       </aside>
 
       <section className="content">
-        {!result ? <EmptyState /> : <Results data={result} />}
+        {!selectedRecording ? (
+          <EmptyState />
+        ) : selectedRecording.result ? (
+          <Results data={selectedRecording.result} />
+        ) : (
+          <RecordingState recording={selectedRecording} />
+        )}
       </section>
     </main>
   );
@@ -101,6 +199,31 @@ function EmptyState() {
       <Mic2 size={38} />
       <h2>Upload a conversation to see metrics.</h2>
       <p>Speaker analytics, timing, interjections, transcript turns, sentiment, and acoustic summaries will appear here.</p>
+    </div>
+  );
+}
+
+function RecordingState({ recording }) {
+  const Icon = recording.status === "failed"
+    ? XCircle
+    : recording.status === "complete"
+      ? CheckCircle2
+      : recording.status === "processing"
+        ? LoaderCircle
+        : HardDriveUpload;
+
+  return (
+    <div className="jobState">
+      <Icon size={42} className={recording.status === "processing" ? "spin" : ""} />
+      <p className="eyebrow">{recording.source} upload</p>
+      <h2>{recording.original_filename}</h2>
+      <KeyValues values={{
+        "Status": statusLabel(recording.status),
+        "Device": recording.device_id || "browser",
+        "Created": formatDate(recording.created_at),
+        "Updated": formatDate(recording.updated_at),
+        "Error": recording.error,
+      }} />
     </div>
   );
 }
@@ -300,6 +423,25 @@ function diarizationLabel(status) {
 function format(value, suffix = "") {
   if (value === null || value === undefined || Number.isNaN(value)) return "n/a";
   return `${value}${suffix}`;
+}
+
+function statusLabel(status) {
+  const labels = {
+    uploaded: "Uploaded",
+    processing: "Processing",
+    complete: "Complete",
+    failed: "Failed",
+  };
+  return labels[status] || status;
+}
+
+function sourceIcon(source) {
+  return source === "device" ? "Wearable" : "Browser";
+}
+
+function formatDate(value) {
+  if (!value) return "n/a";
+  return new Date(value).toLocaleString();
 }
 
 const sec = (value) => format(value, "s");
