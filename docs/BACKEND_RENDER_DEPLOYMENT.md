@@ -118,6 +118,15 @@ pipeline_failed
 
 Warning: installing pyannote and torch makes the Docker image much larger and may increase cold start/build time. It may also make CPU analysis slower. This is normal for this MVP.
 
+If Render shows:
+
+```text
+Failed to build webrtcvad
+error: failed-wheel-build-for-install
+```
+
+make sure the deployed Dockerfile includes `build-essential` in the `apt-get install` line. `webrtcvad` is a native Python package pulled in by the optional diarization stack and needs a compiler when no prebuilt wheel is available.
+
 ## Health Check
 
 After deploy, open:
