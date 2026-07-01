@@ -18,10 +18,10 @@ from faster_whisper import WhisperModel
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 
-UPLOAD_DIR = Path("uploads")
-RUN_DIR = Path("analysis_runs")
-UPLOAD_DIR.mkdir(exist_ok=True)
-RUN_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
+RUN_DIR = Path(os.getenv("RUN_DIR", "analysis_runs"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+RUN_DIR.mkdir(parents=True, exist_ok=True)
 
 FILLERS = {
     "um",

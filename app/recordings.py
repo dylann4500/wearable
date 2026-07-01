@@ -16,7 +16,8 @@ DB_PATH = Path(os.getenv("RECORDINGS_DB", "recordings.sqlite3"))
 RESULT_DIR = Path(os.getenv("RESULT_DIR", "recording_results"))
 SUPPORTED_AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 
-RESULT_DIR.mkdir(exist_ok=True)
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def utc_now() -> str:

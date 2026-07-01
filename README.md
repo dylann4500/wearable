@@ -8,6 +8,12 @@ For full hardware handoff, setup, architecture, and real-world connectivity note
 docs/FRIEND_SETUP_AND_ARCHITECTURE.md
 ```
 
+For the quickest public backend deployment to pair with the Vercel frontend, read:
+
+```text
+docs/BACKEND_RENDER_DEPLOYMENT.md
+```
+
 ## What It Does
 
 - Upload an MP3 or other audio file.
