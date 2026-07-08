@@ -12,3 +12,4 @@ firmware/xiao-esp32s3-prototype/firmware_config.h
 node_modules/
 frontend/node_modules/
 frontend/dist/
+ios/WearableCompanion/.build/

@@ -20,6 +20,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <NimBLEDevice.h>
 #include "firmware_config.h"
 
 // -------------------- I2S object --------------------
@@ -50,10 +51,38 @@ const int I2S_PDM_DATA_PIN = 41;
 const char *AUDIO_DIR = "/Audio";
 
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
+const size_t BLE_TRANSFER_CHUNK_SIZE = 180;
+
+// -------------------- BLE settings --------------------
+
+const char *BLE_DEVICE_NAME = "XIAO Speech Prototype";
+const char *BLE_SERVICE_UUID = "8f2a0001-7b4f-4f9d-9d3f-2f5c0a7a9000";
+const char *BLE_CONTROL_UUID = "8f2a0002-7b4f-4f9d-9d3f-2f5c0a7a9000";
+const char *BLE_STATUS_UUID = "8f2a0003-7b4f-4f9d-9d3f-2f5c0a7a9000";
+const char *BLE_MANIFEST_UUID = "8f2a0004-7b4f-4f9d-9d3f-2f5c0a7a9000";
+const char *BLE_DATA_UUID = "8f2a0005-7b4f-4f9d-9d3f-2f5c0a7a9000";
+
+NimBLECharacteristic *bleStatusCharacteristic = nullptr;
+NimBLECharacteristic *bleManifestCharacteristic = nullptr;
+NimBLECharacteristic *bleDataCharacteristic = nullptr;
 
 // -------------------- Recording state --------------------
 
 volatile bool isRecording = false;
+volatile bool bleRecordingRequested = false;
+volatile bool bleClientConnected = false;
+volatile bool bleTransferInProgress = false;
+TaskHandle_t bleRecordTaskHandle = nullptr;
+TaskHandle_t bleTransferTaskHandle = nullptr;
+String bleActiveRecordingPath = "";
+String bleTransferPath = "";
+uint32_t bleTransferOffset = 0;
+
+bool continueButtonRecording();
+bool continueBleRecording();
+void recordAudioFile(const char *audioFileName, bool (*shouldContinueRecording)());
+void publishRecordingManifest();
+void setupBle();
 
 // -------------------- Button helper --------------------
 
@@ -62,6 +91,24 @@ bool buttonPressed() {
   // Not pressed = HIGH
   // Pressed     = LOW
   return digitalRead(BUTTON_PIN) == LOW;
+}
+
+bool continueButtonRecording() {
+  return buttonPressed();
+}
+
+bool continueBleRecording() {
+  return bleRecordingRequested;
+}
+
+void bleNotifyStatus(String status) {
+  Serial.print("BLE status: ");
+  Serial.println(status);
+
+  if (bleStatusCharacteristic != nullptr) {
+    bleStatusCharacteristic->setValue(status.c_str());
+    bleStatusCharacteristic->notify();
+  }
 }
 
 // -------------------- LED task --------------------
@@ -239,6 +286,11 @@ bool connectToWiFiIfNeeded() {
 }
 
 bool uploadAudioFile(String audioFileName) {
+  if (!ENABLE_WIFI_UPLOAD) {
+    Serial.println("Wi-Fi upload disabled. File will remain available for BLE sync.");
+    return false;
+  }
+
   if (!connectToWiFiIfNeeded()) {
     return false;
   }
@@ -328,10 +380,337 @@ void uploadPendingAudioFiles() {
       continue;
     }
 
-    uploadAudioFile(audioFileName);
+    if (ENABLE_WIFI_UPLOAD) {
+      uploadAudioFile(audioFileName);
+    }
   }
 
   dir.close();
+}
+
+// -------------------- BLE file sync helpers --------------------
+
+String recordingPathFromName(String filename) {
+  filename.trim();
+  filename.replace("/", "");
+  return String(AUDIO_DIR) + "/" + filename;
+}
+
+String buildRecordingManifest() {
+  String manifest = "";
+  File dir = SD.open(AUDIO_DIR);
+  if (!dir || !dir.isDirectory()) {
+    return "ERROR|Cannot open /Audio\n";
+  }
+
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      break;
+    }
+
+    String audioFileName = normalizeAudioPath(String(entry.name()));
+    bool isDirectory = entry.isDirectory();
+    size_t size = entry.size();
+    entry.close();
+
+    if (isDirectory || !hasSuffix(audioFileName, ".wav")) {
+      continue;
+    }
+
+    String syncedMarker = String(audioFileName) + ".phone_synced";
+    manifest += baseName(audioFileName);
+    manifest += "|";
+    manifest += String((uint32_t)size);
+    manifest += "|";
+    manifest += SD.exists(syncedMarker) ? "synced" : "pending";
+    manifest += "\n";
+  }
+
+  dir.close();
+  return manifest;
+}
+
+void publishRecordingManifest() {
+  String manifest = buildRecordingManifest();
+  if (bleManifestCharacteristic != nullptr) {
+    bleManifestCharacteristic->setValue(manifest.c_str());
+  }
+  bleNotifyStatus(String("LIST_READY:") + String(manifest.length()));
+}
+
+void bleRecordTask(void *parameter) {
+  String audioFileName = getNextAudioFileName();
+  bleActiveRecordingPath = audioFileName;
+  bleNotifyStatus(String("RECORDING_STARTED:") + baseName(audioFileName));
+
+  recordAudioFile(audioFileName.c_str(), continueBleRecording);
+
+  bleRecordingRequested = false;
+  bleActiveRecordingPath = "";
+  bleRecordTaskHandle = nullptr;
+
+  publishRecordingManifest();
+  bleNotifyStatus(String("RECORDED:") + baseName(audioFileName));
+  vTaskDelete(NULL);
+}
+
+void writeUint32LE(uint8_t *buffer, uint32_t value) {
+  buffer[0] = value & 0xFF;
+  buffer[1] = (value >> 8) & 0xFF;
+  buffer[2] = (value >> 16) & 0xFF;
+  buffer[3] = (value >> 24) & 0xFF;
+}
+
+void writeUint16LE(uint8_t *buffer, uint16_t value) {
+  buffer[0] = value & 0xFF;
+  buffer[1] = (value >> 8) & 0xFF;
+}
+
+void bleTransferTask(void *parameter) {
+  String path = bleTransferPath;
+  uint32_t offset = bleTransferOffset;
+  bleTransferInProgress = true;
+
+  File file = SD.open(path, FILE_READ);
+  if (!file) {
+    bleNotifyStatus(String("ERROR:Cannot open ") + baseName(path));
+    bleTransferInProgress = false;
+    bleTransferTaskHandle = nullptr;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  uint32_t fileSize = file.size();
+  if (offset > fileSize) {
+    offset = 0;
+  }
+
+  file.seek(offset);
+  bleNotifyStatus(String("TRANSFER_STARTED:") + baseName(path) + ":" + String(fileSize) + ":" + String(offset));
+
+  uint8_t packet[6 + BLE_TRANSFER_CHUNK_SIZE];
+  while (file.available() && bleClientConnected && bleTransferInProgress) {
+    uint32_t currentOffset = file.position();
+    size_t bytesRead = file.read(packet + 6, BLE_TRANSFER_CHUNK_SIZE);
+    if (bytesRead == 0) {
+      break;
+    }
+
+    writeUint32LE(packet, currentOffset);
+    writeUint16LE(packet + 4, (uint16_t)bytesRead);
+    bleDataCharacteristic->setValue(packet, bytesRead + 6);
+    bleDataCharacteristic->notify();
+
+    // Keep the transfer gentle for first hardware bring-up. We can tune this later.
+    vTaskDelay(15 / portTICK_PERIOD_MS);
+  }
+
+  bool completed = file.position() >= fileSize;
+  file.close();
+
+  if (completed) {
+    bleNotifyStatus(String("TRANSFER_DONE:") + baseName(path) + ":" + String(fileSize));
+  } else {
+    bleNotifyStatus(String("TRANSFER_STOPPED:") + baseName(path));
+  }
+
+  bleTransferInProgress = false;
+  bleTransferTaskHandle = nullptr;
+  vTaskDelete(NULL);
+}
+
+void startBleRecording() {
+  if (isRecording || bleRecordTaskHandle != nullptr) {
+    bleNotifyStatus("BUSY:Already recording");
+    return;
+  }
+
+  bleRecordingRequested = true;
+  xTaskCreate(
+    bleRecordTask,
+    "BLE Record Task",
+    8192,
+    NULL,
+    1,
+    &bleRecordTaskHandle
+  );
+}
+
+void stopBleRecording() {
+  if (!bleRecordingRequested) {
+    bleNotifyStatus("IDLE:Not recording");
+    return;
+  }
+
+  bleRecordingRequested = false;
+  bleNotifyStatus("RECORDING_STOPPING");
+}
+
+void startBleTransfer(String filename, uint32_t offset) {
+  if (bleTransferTaskHandle != nullptr || bleTransferInProgress) {
+    bleNotifyStatus("BUSY:Transfer already running");
+    return;
+  }
+
+  String path = recordingPathFromName(filename);
+  if (!SD.exists(path)) {
+    bleNotifyStatus(String("ERROR:Missing ") + filename);
+    return;
+  }
+
+  bleTransferPath = path;
+  bleTransferOffset = offset;
+  xTaskCreate(
+    bleTransferTask,
+    "BLE Transfer Task",
+    8192,
+    NULL,
+    1,
+    &bleTransferTaskHandle
+  );
+}
+
+void stopBleTransfer() {
+  if (!bleTransferInProgress) {
+    bleNotifyStatus("IDLE:No transfer");
+    return;
+  }
+
+  bleTransferInProgress = false;
+}
+
+void markPhoneSynced(String filename) {
+  String path = recordingPathFromName(filename);
+  if (!SD.exists(path)) {
+    bleNotifyStatus(String("ERROR:Missing ") + filename);
+    return;
+  }
+
+  File markerFile = SD.open(String(path) + ".phone_synced", FILE_WRITE);
+  if (markerFile) {
+    markerFile.println("synced");
+    markerFile.close();
+  }
+  publishRecordingManifest();
+  bleNotifyStatus(String("PHONE_SYNCED:") + filename);
+}
+
+void handleBleCommand(String command) {
+  command.trim();
+  Serial.print("BLE command: ");
+  Serial.println(command);
+
+  if (command == "PING") {
+    bleNotifyStatus(String("PONG:") + DEVICE_ID);
+    return;
+  }
+
+  if (command == "LIST") {
+    publishRecordingManifest();
+    return;
+  }
+
+  if (command == "RECORD_START") {
+    startBleRecording();
+    return;
+  }
+
+  if (command == "RECORD_STOP") {
+    stopBleRecording();
+    return;
+  }
+
+  if (command == "TRANSFER_STOP") {
+    stopBleTransfer();
+    return;
+  }
+
+  if (command.startsWith("FETCH:")) {
+    int firstColon = command.indexOf(':');
+    int secondColon = command.indexOf(':', firstColon + 1);
+    String filename = secondColon > 0
+      ? command.substring(firstColon + 1, secondColon)
+      : command.substring(firstColon + 1);
+    uint32_t offset = secondColon > 0
+      ? (uint32_t)command.substring(secondColon + 1).toInt()
+      : 0;
+    startBleTransfer(filename, offset);
+    return;
+  }
+
+  if (command.startsWith("MARK_SYNCED:")) {
+    markPhoneSynced(command.substring(String("MARK_SYNCED:").length()));
+    return;
+  }
+
+  bleNotifyStatus(String("ERROR:Unknown command ") + command);
+}
+
+class WearableServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override {
+    bleClientConnected = true;
+    Serial.print("BLE client connected: ");
+    Serial.println(connInfo.getAddress().toString().c_str());
+    bleNotifyStatus(String("CONNECTED:") + DEVICE_ID);
+  }
+
+  void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override {
+    bleClientConnected = false;
+    bleTransferInProgress = false;
+    Serial.println("BLE client disconnected.");
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+class ControlCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &connInfo) override {
+    std::string value = characteristic->getValue();
+    handleBleCommand(String(value.c_str()));
+  }
+};
+
+void setupBle() {
+  NimBLEDevice::init(BLE_DEVICE_NAME);
+  NimBLEDevice::setMTU(247);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  NimBLEServer *server = NimBLEDevice::createServer();
+  server->setCallbacks(new WearableServerCallbacks());
+
+  NimBLEService *service = server->createService(BLE_SERVICE_UUID);
+
+  NimBLECharacteristic *controlCharacteristic = service->createCharacteristic(
+    BLE_CONTROL_UUID,
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+  );
+  controlCharacteristic->setCallbacks(new ControlCharacteristicCallbacks());
+
+  bleStatusCharacteristic = service->createCharacteristic(
+    BLE_STATUS_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+  bleStatusCharacteristic->setValue("BOOTING");
+
+  bleManifestCharacteristic = service->createCharacteristic(
+    BLE_MANIFEST_UUID,
+    NIMBLE_PROPERTY::READ
+  );
+  bleManifestCharacteristic->setValue("");
+
+  bleDataCharacteristic = service->createCharacteristic(
+    BLE_DATA_UUID,
+    NIMBLE_PROPERTY::NOTIFY
+  );
+
+  NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+  advertising->addServiceUUID(BLE_SERVICE_UUID);
+  advertising->setName(BLE_DEVICE_NAME);
+  advertising->enableScanResponse(true);
+  advertising->start();
+
+  Serial.println("BLE advertising started.");
+  bleNotifyStatus(String("READY:") + DEVICE_ID);
 }
 
 // -------------------- Audio helper --------------------
@@ -354,7 +733,7 @@ void applyVolumeGain(uint8_t *buffer, size_t bytesRead) {
 
 // -------------------- Main recording function --------------------
 
-void recordWhileButtonHeld(const char *audioFileName) {
+void recordAudioFile(const char *audioFileName, bool (*shouldContinueRecording)()) {
   Serial.println();
   Serial.println("Recording started...");
   Serial.printf("Saving to: %s\n", audioFileName);
@@ -385,7 +764,7 @@ void recordWhileButtonHeld(const char *audioFileName) {
   uint32_t totalBytesWritten = 0;
   isRecording = true;
 
-  while (buttonPressed()) {
+  while (shouldContinueRecording()) {
     size_t bytesRead = I2S.readBytes((char *)rec_buffer, BUFFER_SIZE);
 
     if (bytesRead == 0) {
@@ -423,6 +802,10 @@ void recordWhileButtonHeld(const char *audioFileName) {
   Serial.printf("Audio data written: %lu bytes\n", totalBytesWritten);
   Serial.println("WAV header updated.");
   Serial.println("File closed safely.");
+}
+
+void recordWhileButtonHeld(const char *audioFileName) {
+  recordAudioFile(audioFileName, continueButtonRecording);
 }
 
 // -------------------- Setup --------------------
@@ -510,7 +893,13 @@ void setup() {
     }
   }
 
-  uploadPendingAudioFiles();
+  if (ENABLE_WIFI_UPLOAD) {
+    uploadPendingAudioFiles();
+  } else {
+    Serial.println("Wi-Fi upload disabled. Pending files are available over BLE.");
+  }
+
+  setupBle();
 
   Serial.println("Ready.");
   Serial.println("Press and hold the button on D0 to record.");
@@ -519,7 +908,7 @@ void setup() {
 // -------------------- Loop --------------------
 
 void loop() {
-  if (buttonPressed()) {
+  if (!isRecording && buttonPressed()) {
     delay(30); // debounce
 
     if (buttonPressed()) {
@@ -527,7 +916,11 @@ void loop() {
 
       recordWhileButtonHeld(audioFileName.c_str());
 
-      uploadAudioFile(audioFileName);
+      if (ENABLE_WIFI_UPLOAD) {
+        uploadAudioFile(audioFileName);
+      } else {
+        bleNotifyStatus(String("RECORDED:") + baseName(audioFileName));
+      }
 
       delay(200); // prevent accidental double-trigger
 

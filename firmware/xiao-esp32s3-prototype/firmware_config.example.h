@@ -14,3 +14,7 @@ const char *DEVICE_ID = "xiao-esp32s3-prototype-001";
 
 // Must match DEVICE_UPLOAD_TOKEN on the FastAPI server.
 const char *DEVICE_UPLOAD_TOKEN = "dev-device-token";
+
+// Keep this false when testing the BLE phone-sync pipeline.
+// Set true only when you want the prototype to upload directly over known Wi-Fi.
+const bool ENABLE_WIFI_UPLOAD = false;
