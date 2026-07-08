@@ -25,6 +25,7 @@ enum AppTab: String, CaseIterable, Identifiable {
 
 struct AppView: View {
     @Environment(AppState.self) private var appState
+    @Environment(WearableBLEManager.self) private var bleManager
 
     var body: some View {
         @Bindable var appState = appState
@@ -53,6 +54,9 @@ struct AppView: View {
             }
             .tabItem { AppTab.settings.label }
             .tag(AppTab.settings)
+        }
+        .task {
+            bleManager.startAutoSyncNearest()
         }
     }
 }

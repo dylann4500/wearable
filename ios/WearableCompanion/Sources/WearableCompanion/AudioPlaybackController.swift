@@ -17,18 +17,43 @@ final class AudioPlaybackController {
                 return
             }
 
-            player = try AVAudioPlayer(contentsOf: url)
-            player?.prepareToPlay()
-            player?.play()
+            #if os(iOS)
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .spokenAudio)
+            try session.setActive(true)
+            #endif
+
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard let byteSize = attributes[.size] as? NSNumber, byteSize.intValue > 44 else {
+                throw PlaybackError.invalidAudioFile
+            }
+
+            let newPlayer = try AVAudioPlayer(contentsOf: url)
+            guard newPlayer.prepareToPlay(), newPlayer.play() else {
+                throw PlaybackError.couldNotStart
+            }
+            player = newPlayer
             playingURL = url
             errorMessage = nil
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = "This audio file could not be decoded. The app will replace invalid copies during the next wearable sync. \(error.localizedDescription)"
         }
     }
 
     func stop() {
         player?.stop()
         playingURL = nil
+    }
+}
+
+private enum PlaybackError: LocalizedError {
+    case invalidAudioFile
+    case couldNotStart
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidAudioFile: "The downloaded audio file is empty or incomplete."
+        case .couldNotStart: "The audio player could not start."
+        }
     }
 }

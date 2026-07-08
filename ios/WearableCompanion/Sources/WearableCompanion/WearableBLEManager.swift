@@ -22,7 +22,14 @@ final class WearableBLEManager: NSObject {
     private var dataCharacteristic: CBCharacteristic?
     private var activeDownload: ActiveDownload?
     private var autoConnectTask: Task<Void, Never>?
+    private var manifestPollingTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    private var downloadWatchdogTask: Task<Void, Never>?
     private var downloadQueue: [String] = []
+    private var downloadRetryCounts: [String: Int] = [:]
+    private var statusNotificationsReady = false
+    private var dataNotificationsReady = false
+    private var protocolStarted = false
 
     var state: WearableConnectionState = .idle
     var discoveredDevices: [WearablePeripheral] = []
@@ -30,11 +37,13 @@ final class WearableBLEManager: NSObject {
     var statusLog: [String] = []
     var activeRecordingName: String?
     var downloadProgress: [String: Double] = [:]
-    var autoSyncNearestEnabled = false
+    var autoSyncNearestEnabled = true
     var isAutoSyncing = false
 
     override init() {
         super.init()
+        UserDefaults.standard.removeObject(forKey: "PendingWearableRecordingDeletions")
+        recordings = Self.loadLocalRecordings()
         central = CBCentralManager(delegate: self, queue: .main)
     }
 
@@ -58,6 +67,12 @@ final class WearableBLEManager: NSObject {
     }
 
     func startAutoSyncNearest() {
+        guard !isConnected else {
+            autoSyncNearestEnabled = true
+            beginManifestPolling()
+            refreshRecordings()
+            return
+        }
         autoSyncNearestEnabled = true
         isAutoSyncing = true
         appendStatus("AUTO_SYNC:Scanning for nearest wearable")
@@ -70,6 +85,10 @@ final class WearableBLEManager: NSObject {
         isAutoSyncing = false
         autoConnectTask?.cancel()
         autoConnectTask = nil
+        manifestPollingTask?.cancel()
+        manifestPollingTask = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
         downloadQueue = []
         stopScan()
         if activeDownload != nil {
@@ -105,11 +124,30 @@ final class WearableBLEManager: NSObject {
     }
 
     func download(_ recording: WearableAudioRecording) {
+        downloadRetryCounts[recording.filename] = 0
         enqueueDownloads([recording.filename], replaceQueue: true, skipLocalFiles: false)
     }
 
     func localURL(for recording: WearableAudioRecording) -> URL? {
         recordings.first(where: { $0.filename == recording.filename })?.localFileURL
+    }
+
+    func transferState(for recording: WearableAudioRecording) -> WearableTransferState {
+        if recording.localFileURL != nil {
+            return .downloaded
+        }
+        if activeDownload?.filename == recording.filename {
+            return .downloading(downloadProgress[recording.filename] ?? 0)
+        }
+        if downloadQueue.contains(recording.filename) || downloadProgress[recording.filename] == 0 {
+            return .queued
+        }
+        return .onWearable
+    }
+
+    private var isConnected: Bool {
+        if case .connected = state { return true }
+        return false
     }
 
     private func writeCommand(_ command: String) {
@@ -132,6 +170,7 @@ final class WearableBLEManager: NSObject {
                 guard let nearest = self.discoveredDevices.max(by: { $0.rssi < $1.rssi }) else {
                     self.appendStatus("AUTO_SYNC:No wearable found")
                     self.isAutoSyncing = false
+                    self.scheduleReconnect()
                     return
                 }
                 self.appendStatus("AUTO_SYNC:Connecting to \(nearest.name)")
@@ -177,28 +216,35 @@ final class WearableBLEManager: NSObject {
 
         if status.hasPrefix("TRANSFER_DONE:") {
             finishLocalDownload(from: status)
+            return
+        }
+
+        if status.hasPrefix("TRANSFER_ERROR:") || status.hasPrefix("TRANSFER_STOPPED:") {
+            failActiveDownload(reason: status)
         }
     }
 
     private func handleManifest(_ data: Data) {
         guard let text = String(data: data, encoding: .utf8) else { return }
-        let existingLocalURLs = Dictionary(uniqueKeysWithValues: recordings.compactMap { recording in
-            recording.localFileURL.map { (recording.filename, $0) }
-        })
 
-        recordings = text
+        let remoteRecordings: [WearableAudioRecording] = text
             .split(separator: "\n")
             .compactMap { line in
                 let parts = line.split(separator: "|", omittingEmptySubsequences: false)
                 guard parts.count >= 3, let byteSize = Int(parts[1]) else { return nil }
                 let filename = String(parts[0])
+                let localURL = Self.validatedLocalAudioURL(filename: filename, expectedSize: byteSize)
                 return WearableAudioRecording(
                     filename: filename,
                     byteSize: byteSize,
                     syncState: String(parts[2]),
-                    localFileURL: existingLocalURLs[filename] ?? Self.localAudioURL(filename: filename, existsOnly: true)
+                    localFileURL: localURL
                 )
             }
+        let remoteNames = Set(remoteRecordings.map(\.filename))
+        recordings = remoteRecordings + recordings.filter {
+            $0.localFileURL != nil && !remoteNames.contains($0.filename)
+        }
 
         if autoSyncNearestEnabled {
             let missingFilenames = recordings
@@ -210,7 +256,8 @@ final class WearableBLEManager: NSObject {
 
     private func enqueueDownloads(_ filenames: [String], replaceQueue: Bool, skipLocalFiles: Bool) {
         let pending = filenames.filter { filename in
-            recordings.contains(where: { recording in
+            guard activeDownload?.filename != filename else { return false }
+            return recordings.contains(where: { recording in
                 recording.filename == filename && (!skipLocalFiles || recording.localFileURL == nil)
             })
         }
@@ -249,10 +296,18 @@ final class WearableBLEManager: NSObject {
                 return
             }
             try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                try FileManager.default.removeItem(at: fileURL)
+            }
+            guard FileManager.default.createFile(atPath: fileURL.path, contents: nil) else {
+                appendStatus("ERROR:Cannot create local audio file")
+                return
+            }
             let handle = try FileHandle(forWritingTo: fileURL)
             activeDownload = ActiveDownload(filename: filename, totalBytes: totalBytes, fileURL: fileURL, fileHandle: handle, receivedBytes: 0)
             downloadProgress[filename] = 0
+            scheduleDownloadWatchdog()
+            writeCommand("TRANSFER_READY:\(filename)")
         } catch {
             appendStatus("ERROR:Cannot create local file: \(error.localizedDescription)")
         }
@@ -260,8 +315,22 @@ final class WearableBLEManager: NSObject {
 
     private func handleTransferData(_ data: Data) {
         guard var activeDownload, data.count >= 6 else { return }
+        let packetOffset = Int(
+            UInt32(data[0])
+                | UInt32(data[1]) << 8
+                | UInt32(data[2]) << 16
+                | UInt32(data[3]) << 24
+        )
         let payloadLength = Int(UInt16(data[4]) | UInt16(data[5]) << 8)
         guard data.count >= 6 + payloadLength else { return }
+        guard !activeDownload.isCorrupted else { return }
+        guard packetOffset == activeDownload.receivedBytes else {
+            activeDownload.isCorrupted = true
+            self.activeDownload = activeDownload
+            appendStatus("TRANSFER_GAP:\(activeDownload.filename):expected \(activeDownload.receivedBytes):received \(packetOffset)")
+            writeCommand("TRANSFER_STOP")
+            return
+        }
 
         let payload = data.subdata(in: 6..<(6 + payloadLength))
         do {
@@ -269,6 +338,7 @@ final class WearableBLEManager: NSObject {
             activeDownload.receivedBytes += payloadLength
             self.activeDownload = activeDownload
             downloadProgress[activeDownload.filename] = min(1, Double(activeDownload.receivedBytes) / Double(activeDownload.totalBytes))
+            scheduleDownloadWatchdog()
         } catch {
             appendStatus("ERROR:Write failed: \(error.localizedDescription)")
         }
@@ -276,10 +346,34 @@ final class WearableBLEManager: NSObject {
 
     private func finishLocalDownload(from status: String) {
         guard let activeDownload else { return }
+        downloadWatchdogTask?.cancel()
+        downloadWatchdogTask = nil
         do {
             try activeDownload.fileHandle.close()
         } catch {
             appendStatus("ERROR:Close failed: \(error.localizedDescription)")
+        }
+
+        let isComplete = !activeDownload.isCorrupted
+            && activeDownload.receivedBytes == activeDownload.totalBytes
+            && Self.isValidWAV(at: activeDownload.fileURL, expectedSize: activeDownload.totalBytes)
+
+        guard isComplete else {
+            try? FileManager.default.removeItem(at: activeDownload.fileURL)
+            downloadProgress[activeDownload.filename] = 0
+            self.activeDownload = nil
+
+            let retryCount = downloadRetryCounts[activeDownload.filename, default: 0]
+            if retryCount < 2 {
+                downloadRetryCounts[activeDownload.filename] = retryCount + 1
+                downloadQueue.insert(activeDownload.filename, at: 0)
+                appendStatus("TRANSFER_RETRY:\(activeDownload.filename)")
+            } else {
+                downloadProgress[activeDownload.filename] = nil
+                appendStatus("ERROR:Transfer validation failed for \(activeDownload.filename)")
+            }
+            startNextDownloadIfNeeded()
+            return
         }
 
         recordings = recordings.map { recording in
@@ -289,9 +383,158 @@ final class WearableBLEManager: NSObject {
             return updated
         }
         downloadProgress[activeDownload.filename] = 1
+        downloadRetryCounts[activeDownload.filename] = nil
         writeCommand("MARK_SYNCED:\(activeDownload.filename)")
         self.activeDownload = nil
         startNextDownloadIfNeeded()
+    }
+
+    private func scheduleDownloadWatchdog() {
+        downloadWatchdogTask?.cancel()
+        guard let activeDownload else { return }
+        let filename = activeDownload.filename
+        let receivedBytes = activeDownload.receivedBytes
+        downloadWatchdogTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            await MainActor.run {
+                guard let self,
+                      let current = self.activeDownload,
+                      current.filename == filename,
+                      current.receivedBytes == receivedBytes
+                else { return }
+                self.writeCommand("TRANSFER_STOP")
+                self.failActiveDownload(reason: "TRANSFER_TIMEOUT:\(filename)")
+            }
+        }
+    }
+
+    private func failActiveDownload(reason: String) {
+        guard let activeDownload else { return }
+        downloadWatchdogTask?.cancel()
+        downloadWatchdogTask = nil
+        try? activeDownload.fileHandle.close()
+        try? FileManager.default.removeItem(at: activeDownload.fileURL)
+        self.activeDownload = nil
+        downloadProgress[activeDownload.filename] = 0
+
+        let retryCount = downloadRetryCounts[activeDownload.filename, default: 0]
+        if retryCount < 2 {
+            downloadRetryCounts[activeDownload.filename] = retryCount + 1
+            appendStatus("\(reason):Retrying")
+            let filename = activeDownload.filename
+            Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(750))
+                await MainActor.run {
+                    guard let self else { return }
+                    self.enqueueDownloads([filename], replaceQueue: false, skipLocalFiles: true)
+                }
+            }
+        } else {
+            downloadProgress[activeDownload.filename] = nil
+            appendStatus("\(reason):Retry limit reached")
+        }
+        startNextDownloadIfNeeded()
+    }
+
+    private func beginProtocolIfReady() {
+        guard controlCharacteristic != nil,
+              statusNotificationsReady,
+              dataNotificationsReady,
+              !protocolStarted
+        else { return }
+        protocolStarted = true
+        writeCommand("PING")
+        refreshRecordings()
+    }
+
+    private func beginManifestPolling() {
+        manifestPollingTask?.cancel()
+        manifestPollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard let self, self.autoSyncNearestEnabled, self.isConnected else { return }
+                    self.refreshRecordings()
+                }
+            }
+        }
+    }
+
+    private func scheduleReconnect() {
+        guard autoSyncNearestEnabled, reconnectTask == nil else { return }
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            await MainActor.run {
+                guard let self, self.autoSyncNearestEnabled, !self.isConnected else { return }
+                self.reconnectTask = nil
+                self.startAutoSyncNearest()
+            }
+        }
+    }
+
+    private static func loadLocalRecordings() -> [WearableAudioRecording] {
+        guard let directory = localAudioURL(filename: "", existsOnly: false),
+              let urls = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.fileSizeKey],
+                options: [.skipsHiddenFiles]
+              )
+        else { return [] }
+
+        return urls
+            .filter { ["wav", "mp3", "m4a"].contains($0.pathExtension.lowercased()) }
+            .compactMap { url in
+                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                if url.pathExtension.lowercased() == "wav", !isValidWAV(at: url, expectedSize: size) {
+                    try? FileManager.default.removeItem(at: url)
+                    return nil
+                }
+                return WearableAudioRecording(
+                    filename: url.lastPathComponent,
+                    byteSize: size,
+                    syncState: "local",
+                    localFileURL: url
+                )
+            }
+            .sorted { $0.filename > $1.filename }
+    }
+
+    private static func validatedLocalAudioURL(filename: String, expectedSize: Int) -> URL? {
+        guard let url = localAudioURL(filename: filename, existsOnly: true) else { return nil }
+        guard isValidWAV(at: url, expectedSize: expectedSize) else {
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        return url
+    }
+
+    private static func isValidWAV(at url: URL, expectedSize: Int) -> Bool {
+        guard expectedSize > 44,
+              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let fileSize = attributes[.size] as? NSNumber,
+              fileSize.intValue == expectedSize,
+              let handle = try? FileHandle(forReadingFrom: url)
+        else { return false }
+
+        defer { try? handle.close() }
+        guard let header = try? handle.read(upToCount: 44),
+              header.count == 44,
+              String(data: header[0..<4], encoding: .ascii) == "RIFF",
+              String(data: header[8..<12], encoding: .ascii) == "WAVE",
+              String(data: header[36..<40], encoding: .ascii) == "data"
+        else { return false }
+
+        let riffSize = Int(readUInt32LE(header, at: 4))
+        let dataSize = Int(readUInt32LE(header, at: 40))
+        return riffSize == expectedSize - 8 && dataSize == expectedSize - 44
+    }
+
+    private static func readUInt32LE(_ data: Data, at offset: Int) -> UInt32 {
+        UInt32(data[offset])
+            | UInt32(data[offset + 1]) << 8
+            | UInt32(data[offset + 2]) << 16
+            | UInt32(data[offset + 3]) << 24
     }
 
     private static func localAudioURL(filename: String, existsOnly: Bool) -> URL? {
@@ -310,6 +553,9 @@ extension WearableBLEManager: CBCentralManagerDelegate {
             if central.state == .poweredOn {
                 if case .failed = state {
                     state = .idle
+                }
+                if autoSyncNearestEnabled {
+                    startAutoSyncNearest()
                 }
             } else {
                 state = .failed("Bluetooth is \(central.state.displayName).")
@@ -339,6 +585,12 @@ extension WearableBLEManager: CBCentralManagerDelegate {
     nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         Task { @MainActor in
             state = .connected(peripheral.name ?? "Wearable")
+            statusNotificationsReady = false
+            dataNotificationsReady = false
+            protocolStarted = false
+            reconnectTask?.cancel()
+            reconnectTask = nil
+            beginManifestPolling()
             peripheral.discoverServices([serviceUUID])
         }
     }
@@ -346,12 +598,21 @@ extension WearableBLEManager: CBCentralManagerDelegate {
     nonisolated func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         Task { @MainActor in
             state = .failed(error?.localizedDescription ?? "Could not connect.")
+            scheduleReconnect()
         }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         Task { @MainActor in
             state = error.map { .failed($0.localizedDescription) } ?? .disconnected
+            manifestPollingTask?.cancel()
+            manifestPollingTask = nil
+            downloadWatchdogTask?.cancel()
+            downloadWatchdogTask = nil
+            statusNotificationsReady = false
+            dataNotificationsReady = false
+            protocolStarted = false
+            scheduleReconnect()
         }
     }
 }
@@ -395,10 +656,23 @@ extension WearableBLEManager: CBPeripheralDelegate {
                 }
             }
 
-            if controlCharacteristic != nil {
-                writeCommand("PING")
-                refreshRecordings()
+            beginProtocolIfReady()
+        }
+    }
+
+    nonisolated func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        Task { @MainActor in
+            if let error {
+                appendStatus("ERROR:Notification setup failed: \(error.localizedDescription)")
+                return
             }
+
+            if characteristic.uuid == statusUUID {
+                statusNotificationsReady = characteristic.isNotifying
+            } else if characteristic.uuid == dataUUID {
+                dataNotificationsReady = characteristic.isNotifying
+            }
+            beginProtocolIfReady()
         }
     }
 
@@ -432,6 +706,7 @@ private struct ActiveDownload {
     var fileURL: URL
     var fileHandle: FileHandle
     var receivedBytes: Int
+    var isCorrupted = false
 }
 
 private extension CBManagerState {
@@ -457,7 +732,7 @@ final class WearableBLEManager {
     var statusLog: [String] = []
     var activeRecordingName: String?
     var downloadProgress: [String: Double] = [:]
-    var autoSyncNearestEnabled = false
+    var autoSyncNearestEnabled = true
     var isAutoSyncing = false
 
     func startScan() {}
@@ -471,5 +746,8 @@ final class WearableBLEManager {
     func stopWearableRecording() {}
     func download(_ recording: WearableAudioRecording) {}
     func localURL(for recording: WearableAudioRecording) -> URL? { nil }
+    func transferState(for recording: WearableAudioRecording) -> WearableTransferState {
+        recording.localFileURL == nil ? .onWearable : .downloaded
+    }
 }
 #endif

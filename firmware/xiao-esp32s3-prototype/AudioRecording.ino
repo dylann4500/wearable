@@ -41,6 +41,7 @@ const int RECORD_LED_PIN = D1;
 
 // XIAO ESP32S3 Sense microSD CS pin
 const int SD_CS_PIN = 21;
+const uint32_t SD_SPI_FREQUENCY = 1000000;
 
 // XIAO ESP32S3 Sense onboard MEMS microphone pins
 const int I2S_PDM_CLK_PIN = 42;
@@ -51,7 +52,9 @@ const int I2S_PDM_DATA_PIN = 41;
 const char *AUDIO_DIR = "/Audio";
 
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
-const size_t BLE_TRANSFER_CHUNK_SIZE = 180;
+// iOS commonly negotiates a 185-byte ATT MTU, leaving 182 bytes for a
+// characteristic value. Reserve 6 bytes for our offset/length header.
+const size_t BLE_TRANSFER_CHUNK_SIZE = 160;
 
 // -------------------- BLE settings --------------------
 
@@ -72,6 +75,8 @@ volatile bool isRecording = false;
 volatile bool bleRecordingRequested = false;
 volatile bool bleClientConnected = false;
 volatile bool bleTransferInProgress = false;
+volatile bool bleTransferReceiverReady = false;
+volatile bool storageReady = false;
 TaskHandle_t bleRecordTaskHandle = nullptr;
 TaskHandle_t bleTransferTaskHandle = nullptr;
 String bleActiveRecordingPath = "";
@@ -83,6 +88,21 @@ bool continueBleRecording();
 void recordAudioFile(const char *audioFileName, bool (*shouldContinueRecording)());
 void publishRecordingManifest();
 void setupBle();
+
+bool tryRecoverStorage() {
+  SD.end();
+  if (!SD.begin(SD_CS_PIN, SPI, SD_SPI_FREQUENCY) || SD.cardType() == CARD_NONE) {
+    return false;
+  }
+  if (!makeAudioDirectoryIfNeeded()) {
+    return false;
+  }
+
+  storageReady = true;
+  Serial.println("MicroSD storage ready.");
+  bleNotifyStatus("STORAGE_READY");
+  return true;
+}
 
 // -------------------- Button helper --------------------
 
@@ -192,6 +212,34 @@ bool makeAudioDirectoryIfNeeded() {
     Serial.println("Failed to create /Audio directory!");
     return false;
   }
+}
+
+void clearAudioDirectory() {
+  File dir = SD.open(AUDIO_DIR);
+  if (!dir || !dir.isDirectory()) {
+    Serial.println("CLEAR_RECORDINGS_FAILED:Cannot open /Audio");
+    return;
+  }
+
+  int removedCount = 0;
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      break;
+    }
+
+    String path = normalizeAudioPath(String(entry.name()));
+    bool isDirectory = entry.isDirectory();
+    entry.close();
+
+    if (!isDirectory && SD.remove(path)) {
+      removedCount++;
+    }
+  }
+  dir.close();
+
+  publishRecordingManifest();
+  Serial.printf("CLEAR_RECORDINGS_DONE:%d\n", removedCount);
 }
 
 String getNextAudioFileName() {
@@ -418,6 +466,11 @@ String buildRecordingManifest() {
       continue;
     }
 
+    // Do not advertise a WAV until its final header is written and the file is closed.
+    if (audioFileName == bleActiveRecordingPath) {
+      continue;
+    }
+
     String syncedMarker = String(audioFileName) + ".phone_synced";
     manifest += baseName(audioFileName);
     manifest += "|";
@@ -441,13 +494,11 @@ void publishRecordingManifest() {
 
 void bleRecordTask(void *parameter) {
   String audioFileName = getNextAudioFileName();
-  bleActiveRecordingPath = audioFileName;
   bleNotifyStatus(String("RECORDING_STARTED:") + baseName(audioFileName));
 
   recordAudioFile(audioFileName.c_str(), continueBleRecording);
 
   bleRecordingRequested = false;
-  bleActiveRecordingPath = "";
   bleRecordTaskHandle = nullptr;
 
   publishRecordingManifest();
@@ -489,7 +540,22 @@ void bleTransferTask(void *parameter) {
   file.seek(offset);
   bleNotifyStatus(String("TRANSFER_STARTED:") + baseName(path) + ":" + String(fileSize) + ":" + String(offset));
 
+  unsigned long readyDeadline = millis() + 5000;
+  while (bleClientConnected && bleTransferInProgress && !bleTransferReceiverReady && millis() < readyDeadline) {
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+
+  if (!bleTransferReceiverReady) {
+    file.close();
+    bleTransferInProgress = false;
+    bleTransferTaskHandle = nullptr;
+    bleNotifyStatus(String("TRANSFER_ERROR:Phone not ready:") + baseName(path));
+    vTaskDelete(NULL);
+    return;
+  }
+
   uint8_t packet[6 + BLE_TRANSFER_CHUNK_SIZE];
+  bool sendFailed = false;
   while (file.available() && bleClientConnected && bleTransferInProgress) {
     uint32_t currentOffset = file.position();
     size_t bytesRead = file.read(packet + 6, BLE_TRANSFER_CHUNK_SIZE);
@@ -499,28 +565,39 @@ void bleTransferTask(void *parameter) {
 
     writeUint32LE(packet, currentOffset);
     writeUint16LE(packet + 4, (uint16_t)bytesRead);
-    bleDataCharacteristic->setValue(packet, bytesRead + 6);
-    bleDataCharacteristic->notify();
+    // Notifications can be streamed continuously. iOS validates every packet
+    // offset and the final WAV size/header before accepting the local file.
+    if (!bleDataCharacteristic->notify(packet, bytesRead + 6)) {
+      sendFailed = true;
+      break;
+    }
 
     // Keep the transfer gentle for first hardware bring-up. We can tune this later.
     vTaskDelay(15 / portTICK_PERIOD_MS);
   }
 
-  bool completed = file.position() >= fileSize;
+  bool completed = !sendFailed && file.position() >= fileSize;
   file.close();
+  bleTransferInProgress = false;
+  bleTransferTaskHandle = nullptr;
 
-  if (completed) {
+  if (sendFailed) {
+    bleNotifyStatus(String("TRANSFER_ERROR:BLE send failed:") + baseName(path));
+  } else if (completed) {
     bleNotifyStatus(String("TRANSFER_DONE:") + baseName(path) + ":" + String(fileSize));
   } else {
     bleNotifyStatus(String("TRANSFER_STOPPED:") + baseName(path));
   }
 
-  bleTransferInProgress = false;
-  bleTransferTaskHandle = nullptr;
   vTaskDelete(NULL);
 }
 
 void startBleRecording() {
+  if (!storageReady) {
+    bleNotifyStatus("ERROR:SD card unavailable");
+    return;
+  }
+
   if (isRecording || bleRecordTaskHandle != nullptr) {
     bleNotifyStatus("BUSY:Already recording");
     return;
@@ -554,6 +631,10 @@ void startBleTransfer(String filename, uint32_t offset) {
   }
 
   String path = recordingPathFromName(filename);
+  if (path == bleActiveRecordingPath) {
+    bleNotifyStatus(String("BUSY:Recording not finalized ") + filename);
+    return;
+  }
   if (!SD.exists(path)) {
     bleNotifyStatus(String("ERROR:Missing ") + filename);
     return;
@@ -561,6 +642,7 @@ void startBleTransfer(String filename, uint32_t offset) {
 
   bleTransferPath = path;
   bleTransferOffset = offset;
+  bleTransferReceiverReady = false;
   xTaskCreate(
     bleTransferTask,
     "BLE Transfer Task",
@@ -623,6 +705,14 @@ void handleBleCommand(String command) {
 
   if (command == "TRANSFER_STOP") {
     stopBleTransfer();
+    return;
+  }
+
+  if (command.startsWith("TRANSFER_READY:")) {
+    String filename = command.substring(String("TRANSFER_READY:").length());
+    if (recordingPathFromName(filename) == bleTransferPath && bleTransferInProgress) {
+      bleTransferReceiverReady = true;
+    }
     return;
   }
 
@@ -738,11 +828,13 @@ void recordAudioFile(const char *audioFileName, bool (*shouldContinueRecording)(
   Serial.println("Recording started...");
   Serial.printf("Saving to: %s\n", audioFileName);
   Serial.println("Release button to stop recording.");
+  bleActiveRecordingPath = String(audioFileName);
 
   File file = SD.open(audioFileName, FILE_WRITE);
 
   if (!file) {
     Serial.println("Failed to open audio file for writing!");
+    bleActiveRecordingPath = "";
     return;
   }
 
@@ -758,6 +850,7 @@ void recordAudioFile(const char *audioFileName, bool (*shouldContinueRecording)(
   if (rec_buffer == NULL) {
     Serial.println("Failed to allocate recording buffer!");
     file.close();
+    bleActiveRecordingPath = "";
     return;
   }
 
@@ -797,6 +890,7 @@ void recordAudioFile(const char *audioFileName, bool (*shouldContinueRecording)(
 
   free(rec_buffer);
   file.close();
+  bleActiveRecordingPath = "";
 
   Serial.println("Recording stopped.");
   Serial.printf("Audio data written: %lu bytes\n", totalBytesWritten);
@@ -849,26 +943,20 @@ void setup() {
   Serial.println("I2S microphone OK.");
 
   // Initialize SD card
-  if (!SD.begin(SD_CS_PIN)) {
+  if (!SD.begin(SD_CS_PIN, SPI, SD_SPI_FREQUENCY)) {
     Serial.println("Failed to mount MicroSD card!");
-
-    while (1) {
-      // Keep LED solid ON to show device still has power.
-      digitalWrite(RECORD_LED_PIN, HIGH);
-      delay(1000);
-    }
+    setupBle();
+    bleNotifyStatus("ERROR:SD mount failed");
+    return;
   }
 
   uint8_t cardType = SD.cardType();
 
   if (cardType == CARD_NONE) {
     Serial.println("No MicroSD card inserted!");
-
-    while (1) {
-      // Keep LED solid ON to show device still has power.
-      digitalWrite(RECORD_LED_PIN, HIGH);
-      delay(1000);
-    }
+    setupBle();
+    bleNotifyStatus("ERROR:No SD card");
+    return;
   }
 
   Serial.print("MicroSD Card Type: ");
@@ -885,21 +973,19 @@ void setup() {
 
   if (!makeAudioDirectoryIfNeeded()) {
     Serial.println("Cannot continue without /Audio directory.");
-
-    while (1) {
-      // Keep LED solid ON to show device still has power.
-      digitalWrite(RECORD_LED_PIN, HIGH);
-      delay(1000);
-    }
+    setupBle();
+    bleNotifyStatus("ERROR:Cannot create /Audio");
+    return;
   }
+
+  storageReady = true;
+  setupBle();
 
   if (ENABLE_WIFI_UPLOAD) {
     uploadPendingAudioFiles();
   } else {
     Serial.println("Wi-Fi upload disabled. Pending files are available over BLE.");
   }
-
-  setupBle();
 
   Serial.println("Ready.");
   Serial.println("Press and hold the button on D0 to record.");
@@ -908,7 +994,26 @@ void setup() {
 // -------------------- Loop --------------------
 
 void loop() {
-  if (!isRecording && buttonPressed()) {
+  if (!storageReady) {
+    static unsigned long lastStorageRetryMs = 0;
+    if (millis() - lastStorageRetryMs >= 3000) {
+      lastStorageRetryMs = millis();
+      Serial.println("Retrying MicroSD mount...");
+      tryRecoverStorage();
+    }
+    delay(20);
+    return;
+  }
+
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    if (command == "CLEAR_RECORDINGS") {
+      clearAudioDirectory();
+    }
+  }
+
+  if (storageReady && !isRecording && buttonPressed()) {
     delay(30); // debounce
 
     if (buttonPressed()) {

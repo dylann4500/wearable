@@ -18,6 +18,22 @@ struct WearableAudioRecording: Identifiable, Hashable {
     }
 }
 
+enum WearableTransferState: Equatable {
+    case onWearable
+    case queued
+    case downloading(Double)
+    case downloaded
+
+    var label: String {
+        switch self {
+        case .onWearable: "On wearable"
+        case .queued: "Queued"
+        case .downloading(let progress): "Downloading \(Int(progress * 100))%"
+        case .downloaded: "On this iPhone"
+        }
+    }
+}
+
 enum WearableConnectionState: Equatable {
     case idle
     case scanning

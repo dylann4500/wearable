@@ -10,6 +10,8 @@ struct SettingsView: View {
 
         Form {
             Section("Backend") {
+                Toggle("Enable cloud backend", isOn: $appState.isBackendEnabled)
+
                 TextField("Backend URL", text: $backendURLText)
                     #if os(iOS)
                     .textInputAutocapitalization(.never)
@@ -22,6 +24,12 @@ struct SettingsView: View {
                 }
 
                 LabeledContent("Active URL", value: appState.backendBaseURL.absoluteString)
+
+                if !appState.isBackendEnabled {
+                    Text("Cloud processing is off. The app will not contact the backend or show connection errors.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Device security") {

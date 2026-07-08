@@ -107,7 +107,7 @@ struct DevicePairingView: View {
                     Label(activeRecordingName, systemImage: "waveform")
                         .foregroundStyle(.red)
                 } else {
-                    Text("You can also use the hardware button; completed WAV files appear after refresh.")
+                    Text("You can also use the hardware button. Saved WAV files are detected and downloaded automatically.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -137,7 +137,7 @@ struct DevicePairingView: View {
 
             if !bleManager.statusLog.isEmpty {
                 Section("BLE status") {
-                    ForEach(bleManager.statusLog, id: \.self) { status in
+                    ForEach(Array(bleManager.statusLog.enumerated()), id: \.offset) { _, status in
                         Text(status)
                             .font(.caption.monospaced())
                     }
@@ -181,6 +181,9 @@ private struct WearableRecordingRow: View {
     @Environment(AudioPlaybackController.self) private var playback
 
     var recording: WearableAudioRecording
+    private var transferState: WearableTransferState {
+        bleManager.transferState(for: recording)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -188,7 +191,7 @@ private struct WearableRecordingRow: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(recording.filename)
                         .font(.headline)
-                    Text("\(recording.displaySize) · \(recording.syncState)")
+                    Text("\(recording.displaySize) · \(transferState.label)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -199,8 +202,17 @@ private struct WearableRecordingRow: View {
                 }
             }
 
-            if let progress = bleManager.downloadProgress[recording.filename], progress > 0, progress < 1 {
-                ProgressView(value: progress)
+            if case .downloading(let progress) = transferState {
+                ProgressView(value: progress) {
+                    Text("BLE transfer")
+                } currentValueLabel: {
+                    Text("\(Int(progress * 100))%")
+                }
+                .font(.caption)
+            } else if case .queued = transferState {
+                Label("Queued for BLE transfer", systemImage: "clock")
+                    .font(.caption)
+                    .foregroundStyle(.blue)
             }
 
             HStack {
@@ -221,6 +233,7 @@ private struct WearableRecordingRow: View {
                 }
             }
             .font(.callout)
+
         }
         .padding(.vertical, 6)
     }
