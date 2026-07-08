@@ -6,17 +6,25 @@ import {
   Brain,
   CheckCircle2,
   Clock3,
+  Database,
+  FileJson,
   HardDriveUpload,
+  Layers3,
   LoaderCircle,
   MessageSquareQuote,
   Mic2,
   Pause,
   Radio,
   RefreshCw,
+  Save,
+  SlidersHorizontal,
   Sparkles,
+  Tags,
   Upload,
   Users,
   Volume2,
+  WandSparkles,
+  Workflow,
   XCircle,
 } from "lucide-react";
 import "./styles.css";
@@ -191,7 +199,12 @@ function App() {
         {!selectedRecording ? (
           <EmptyState />
         ) : selectedRecording.result ? (
-          <Results data={selectedRecording.result} />
+          <Results
+            recording={selectedRecording}
+            data={selectedRecording.result}
+            onRefresh={() => refreshRecording(selectedRecording.id, { quiet: true })}
+            setStatus={setStatus}
+          />
         ) : (
           <RecordingState recording={selectedRecording} />
         )}
@@ -235,7 +248,7 @@ function RecordingState({ recording }) {
   );
 }
 
-function Results({ data }) {
+function Results({ recording, data, onRefresh, setStatus }) {
   const metadata = data.metadata || {};
   const summary = data.summary || {};
   const speakers = data.speakers || {};
@@ -246,6 +259,8 @@ function Results({ data }) {
   const sentiment = data.sentiment || {};
   const interjections = data.interjections || { events: [], estimated_count: 0 };
   const transcript = data.transcript || [];
+  const insights = data.insights || {};
+  const interpretation = data.interpretation || null;
   const summaryValues = {
     ...summary,
     interjections: interjections.estimated_count,
@@ -274,6 +289,14 @@ function Results({ data }) {
           </article>
         ))}
       </section>
+
+      <PipelineExplorer
+        recording={recording}
+        insights={insights}
+        interpretation={interpretation}
+        onRefresh={onRefresh}
+        setStatus={setStatus}
+      />
 
       <Panel title="Speaker Breakdown">
         <SpeakerTable speakers={speakers} />
@@ -363,6 +386,435 @@ function Results({ data }) {
   );
 }
 
+function PipelineExplorer({ recording, insights, interpretation, onRefresh, setStatus }) {
+  const [isInterpreting, setIsInterpreting] = useState(false);
+  const [labels, setLabels] = useState([]);
+  const [isLoadingLabels, setIsLoadingLabels] = useState(false);
+  const [labelDraft, setLabelDraft] = useState({
+    scope: "conversation",
+    target: "warmth",
+    value: "",
+    confidence: "0.8",
+    rationale: "",
+  });
+
+  useEffect(() => {
+    loadLabels({ quiet: true });
+  }, [recording.id]);
+
+  async function runInterpretation() {
+    setIsInterpreting(true);
+    setStatus("Rerunning context interpretation and refreshing context-aware priorities.");
+    try {
+      await fetchJson(`/api/recordings/${recording.id}/interpret`, { method: "POST" });
+      await onRefresh();
+      await loadLabels({ quiet: true });
+      setStatus("Interpretation refreshed. Context-aware priorities are updated.");
+    } catch (error) {
+      setStatus(apiErrorMessage(error));
+    } finally {
+      setIsInterpreting(false);
+    }
+  }
+
+  async function loadLabels(options = {}) {
+    if (!options.quiet) setIsLoadingLabels(true);
+    try {
+      const payload = await fetchJson(`/api/recordings/${recording.id}/labels`);
+      setLabels(payload);
+    } catch (error) {
+      if (!options.quiet) setStatus(apiErrorMessage(error));
+    } finally {
+      if (!options.quiet) setIsLoadingLabels(false);
+    }
+  }
+
+  async function saveLabel(event) {
+    event.preventDefault();
+    const value = parseLabelValue(labelDraft.value);
+    if (value === "") return;
+    try {
+      await fetchJson(`/api/recordings/${recording.id}/labels`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          scope: labelDraft.scope,
+          target: labelDraft.target,
+          value,
+          source: "human",
+          confidence: Number(labelDraft.confidence),
+          rationale: labelDraft.rationale || "Manual UI label.",
+        }),
+      });
+      setLabelDraft((draft) => ({ ...draft, value: "", rationale: "" }));
+      await loadLabels({ quiet: true });
+      setStatus("Label saved. Training export now includes this curated row.");
+    } catch (error) {
+      setStatus(apiErrorMessage(error));
+    }
+  }
+
+  const hasInsights = Object.keys(insights?.scores || {}).length > 0;
+
+  return (
+    <section className="pipeline">
+      <div className="pipelineHeader">
+        <div>
+          <p className="eyebrow">ML pipeline</p>
+          <h2>From raw signals to coaching</h2>
+        </div>
+        <button type="button" className="primaryAction" onClick={runInterpretation} disabled={isInterpreting || !hasInsights}>
+          {isInterpreting ? <LoaderCircle size={18} className="spin" /> : <WandSparkles size={18} />}
+          Reinterpret
+        </button>
+      </div>
+
+      <PipelineFlow hasInsights={hasInsights} hasInterpretation={Boolean(interpretation)} labelCount={labels.length} />
+
+      {!hasInsights ? (
+        <Panel title="Insight Layer Missing">
+          <p className="panelNote">This recording was analyzed before the new insight layer existed. Re-run analysis, then interpret it.</p>
+        </Panel>
+      ) : (
+        <>
+          <section className="metricGrid">
+            <ContextFocusPanel insights={insights} interpretation={interpretation} />
+            <InsightScorePanel scores={insights.contextualized_scores || insights.scores || {}} />
+          </section>
+
+          <section className="metricGrid">
+            <InterpretationPanel interpretation={interpretation} runInterpretation={runInterpretation} isInterpreting={isInterpreting} />
+            <MiddleLayerPanel middle={insights.middle_layer || {}} />
+          </section>
+
+          <section className="metricGrid">
+            <RawFeaturePanel features={insights.raw_feature_snapshot || {}} />
+            <LabelPanel
+              labels={labels}
+              isLoadingLabels={isLoadingLabels}
+              labelDraft={labelDraft}
+              setLabelDraft={setLabelDraft}
+              saveLabel={saveLabel}
+              loadLabels={loadLabels}
+              interpretation={interpretation}
+            />
+            <TrainingExportPanel />
+          </section>
+        </>
+      )}
+    </section>
+  );
+}
+
+function PipelineFlow({ hasInsights, hasInterpretation, labelCount }) {
+  const steps = [
+    ["Raw metrics", "Transcript, timing, prosody, language counts", true, Activity],
+    ["Middle layer", "Balance, listening, reactivity, clarity", hasInsights, Layers3],
+    ["Top scores", "Warmth, curiosity, regulation, generosity", hasInsights, SlidersHorizontal],
+    ["LLM context", "Auto-generated context and weighted priorities", hasInterpretation, Workflow],
+    ["Labels", `${labelCount} curated labels saved`, labelCount > 0, Database],
+  ];
+  return (
+    <div className="pipelineFlow">
+      {steps.map(([title, detail, active, Icon]) => (
+        <div className={active ? "pipelineStep active" : "pipelineStep"} key={title}>
+          <Icon size={18} />
+          <strong>{title}</strong>
+          <span>{detail}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ContextFocusPanel({ insights, interpretation }) {
+  const context = insights.context || interpretation?.context || {};
+  const brief = context.brief || interpretation?.discussion_brief || interpretation?.summary;
+  const focus = insights.primary_focus || [];
+  const strengths = insights.contextual_strengths || [];
+  return (
+    <Panel title={<span className="titleWithIcon"><Workflow size={18} />Context-Aware Focus</span>}>
+      <div className="contextBox">
+        <div>
+          <span>Context</span>
+          <strong>{humanize(context.type || "pending")}</strong>
+        </div>
+        <div>
+          <span>Confidence</span>
+          <strong>{format(context.confidence)}</strong>
+        </div>
+        <div>
+          <span>Source</span>
+          <strong>{interpretation?.provider || "pending"}</strong>
+        </div>
+      </div>
+      {brief && (
+        <div className="briefBox">
+          <span>Discussion brief</span>
+          <strong>{brief}</strong>
+        </div>
+      )}
+      <p className="panelNote">{context.why_it_matters || "Context-aware priorities appear after the analysis interpretation step completes."}</p>
+      <div className="miniList">
+        <strong>Highest-priority growth areas</strong>
+        {focus.length === 0 ? (
+          <span>No contextual priorities yet.</span>
+        ) : focus.map((item) => (
+          <div className="priorityItem" key={item.variable}>
+            <span>{humanize(item.variable)} · {item.importance}</span>
+            <b>{format(item.priority)}</b>
+          </div>
+        ))}
+      </div>
+      <div className="miniList">
+        <strong>Contextual strengths</strong>
+        {strengths.length === 0 ? (
+          <span>No contextual strengths yet.</span>
+        ) : strengths.map((item) => (
+          <div className="priorityItem" key={item.variable}>
+            <span>{humanize(item.variable)} · {item.importance}</span>
+            <b>{format(item.score)}</b>
+          </div>
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+function InsightScorePanel({ scores }) {
+  return (
+    <Panel title={<span className="titleWithIcon"><SlidersHorizontal size={18} />Contextualized Scores</span>}>
+      <div className="scoreList">
+        {Object.entries(scores).map(([name, item]) => (
+          <ScoreRow key={name} name={name} item={item} />
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+function MiddleLayerPanel({ middle }) {
+  return (
+    <Panel title={<span className="titleWithIcon"><Layers3 size={18} />Middle-Layer Behaviors</span>}>
+      <div className="scoreList compact">
+        {Object.entries(middle).map(([name, item]) => (
+          <ScoreRow key={name} name={name} item={item} />
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+function ScoreRow({ name, item }) {
+  const score = item?.score;
+  const numericScore = Number(score || 0);
+  const details = [];
+  if (item?.confidence !== undefined) details.push(`confidence ${format(item.confidence)}`);
+  if (item?.context_weight !== undefined) details.push(`weight ${format(item.context_weight)}`);
+  if (item?.priority !== undefined) details.push(`priority ${format(item.priority)}`);
+  if (item?.importance) details.push(item.importance);
+  return (
+    <div className="scoreRow">
+      <div>
+        <strong>{humanize(name)}</strong>
+        <span>{details.join(" · ")}</span>
+      </div>
+      <div className="scoreMeter" aria-label={`${humanize(name)} score ${numericScore}`}>
+        <span style={{ width: `${Math.max(0, Math.min(100, numericScore))}%` }} />
+      </div>
+      <b>{format(score)}</b>
+    </div>
+  );
+}
+
+function InterpretationPanel({ interpretation, runInterpretation, isInterpreting }) {
+  if (!interpretation) {
+    return (
+      <Panel title={<span className="titleWithIcon"><WandSparkles size={18} />Context Interpretation</span>}>
+        <p className="panelNote">New analyses run interpretation automatically. Use Reinterpret after changing provider settings or prompts.</p>
+        <button type="button" className="secondaryAction" onClick={runInterpretation} disabled={isInterpreting}>
+          {isInterpreting ? <LoaderCircle size={16} className="spin" /> : <WandSparkles size={16} />}
+          Reinterpret
+        </button>
+      </Panel>
+    );
+  }
+  const context = interpretation.context || {};
+  const brief = context.brief || interpretation.discussion_brief;
+  return (
+    <Panel title={<span className="titleWithIcon"><WandSparkles size={18} />Context Interpretation</span>}>
+      <div className="contextBox">
+        <div>
+          <span>Context</span>
+          <strong>{humanize(context.type || "unknown")}</strong>
+        </div>
+        <div>
+          <span>Confidence</span>
+          <strong>{format(context.confidence)}</strong>
+        </div>
+        <div>
+          <span>Provider</span>
+          <strong>{interpretation.provider || "local"}</strong>
+        </div>
+      </div>
+      {brief && (
+        <div className="briefBox">
+          <span>Discussion brief</span>
+          <strong>{brief}</strong>
+        </div>
+      )}
+      <p className="analysisText">{interpretation.summary}</p>
+      <p className="panelNote">{context.why_it_matters}</p>
+      <ListBlock title="Action plan" items={interpretation.action_plan || []} />
+      <PriorityList priorities={interpretation.context_weighted_priorities || []} />
+    </Panel>
+  );
+}
+
+function PriorityList({ priorities }) {
+  if (!priorities.length) return null;
+  return (
+    <div className="miniList">
+      <strong>Context-weighted priorities</strong>
+      {priorities.slice(0, 5).map((item) => (
+        <div className="priorityItem" key={item.variable}>
+          <span>{humanize(item.variable)}</span>
+          <b>{format(item.priority)}</b>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function RawFeaturePanel({ features }) {
+  return (
+    <Panel title={<span className="titleWithIcon"><FileJson size={18} />Raw Feature Snapshot</span>}>
+      <div className="featureGrid">
+        {Object.entries(features).map(([key, value]) => (
+          <div className="featureCell" key={key}>
+            <span>{humanize(key)}</span>
+            <strong>{format(value)}</strong>
+          </div>
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+function LabelPanel({ labels, isLoadingLabels, labelDraft, setLabelDraft, saveLabel, loadLabels, interpretation }) {
+  const suggestions = interpretation?.label_suggestions || [];
+  return (
+    <Panel title={<span className="titleWithIcon"><Tags size={18} />Curated Labels</span>}>
+      <form className="labelForm" onSubmit={saveLabel}>
+        <select value={labelDraft.scope} onChange={(event) => setLabelDraft((draft) => ({ ...draft, scope: event.target.value }))}>
+          <option value="conversation">Conversation</option>
+          <option value="segment">Segment</option>
+          <option value="turn_pair">Turn pair</option>
+          <option value="turn">Turn</option>
+        </select>
+        <select value={labelDraft.target} onChange={(event) => setLabelDraft((draft) => ({ ...draft, target: event.target.value }))}>
+          <option value="warmth">Warmth</option>
+          <option value="curiosity">Curiosity</option>
+          <option value="conversational_balance">Conversational balance</option>
+          <option value="respectful_disagreeability">Respectful disagreeability</option>
+          <option value="emotional_regulation">Emotional regulation</option>
+          <option value="clarity">Clarity</option>
+          <option value="context_type">Context type</option>
+        </select>
+        <input
+          value={labelDraft.value}
+          placeholder="Value"
+          onChange={(event) => setLabelDraft((draft) => ({ ...draft, value: event.target.value }))}
+        />
+        <input
+          type="number"
+          min="0"
+          max="1"
+          step="0.05"
+          value={labelDraft.confidence}
+          aria-label="Label confidence"
+          onChange={(event) => setLabelDraft((draft) => ({ ...draft, confidence: event.target.value }))}
+        />
+        <textarea
+          value={labelDraft.rationale}
+          placeholder="Rationale"
+          onChange={(event) => setLabelDraft((draft) => ({ ...draft, rationale: event.target.value }))}
+        />
+        <button type="submit" className="secondaryAction">
+          <Save size={16} />
+          Save label
+        </button>
+      </form>
+
+      <div className="labelHeader">
+        <strong>Saved labels</strong>
+        <button type="button" onClick={() => loadLabels()} disabled={isLoadingLabels}>
+          <RefreshCw size={14} />
+        </button>
+      </div>
+      {labels.length === 0 ? (
+        <p className="panelNote">No curated labels saved yet.</p>
+      ) : (
+        <div className="labelList">
+          {labels.map((label) => (
+            <div className="labelItem" key={label.id}>
+              <strong>{humanize(label.target)}: {format(label.value)}</strong>
+              <span>{label.scope} · {label.source} · confidence {format(label.confidence)}</span>
+              <p>{label.rationale}</p>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {suggestions.length > 0 && (
+        <div className="miniList">
+          <strong>LLM label suggestions</strong>
+          {suggestions.slice(0, 6).map((item, index) => (
+            <div className="suggestionItem" key={`${item.target}-${index}`}>
+              <span>{humanize(item.target)}: {format(item.value)}</span>
+              <small>{item.rationale}</small>
+            </div>
+          ))}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function TrainingExportPanel() {
+  return (
+    <Panel title={<span className="titleWithIcon"><Database size={18} />Training Dataset Export</span>}>
+      <p className="panelNote">
+        Export rows combine raw feature snapshots, deterministic scores, interpretation context, and curated labels.
+      </p>
+      <div className="exportActions">
+        <a className="secondaryLink" href={apiUrl("/api/training/labels")} target="_blank" rel="noreferrer">
+          <FileJson size={16} />
+          View JSON
+        </a>
+        <a className="secondaryLink" href={apiUrl("/api/training/labels.jsonl")} target="_blank" rel="noreferrer">
+          <Database size={16} />
+          Download JSONL
+        </a>
+      </div>
+      <div className="pipelineNote">
+        <strong>Training loop</strong>
+        <span>Upload conversations, run interpretation, add human labels, export JSONL, then train Ridge/ElasticNet/tree models against real labels.</span>
+      </div>
+    </Panel>
+  );
+}
+
+function ListBlock({ title, items }) {
+  if (!items.length) return null;
+  return (
+    <div className="miniList">
+      <strong>{title}</strong>
+      {items.map((item, index) => <span key={`${item}-${index}`}>{item}</span>)}
+    </div>
+  );
+}
+
 function Panel({ title, children }) {
   return (
     <section className="panel">
@@ -437,6 +889,21 @@ function diarizationLabel(status) {
     return `resemblyzer: ${status.speaker_count || "?"} speakers · pyannote ${status.fallback_reason.status}`;
   }
   return `${backend}: ${status.speaker_count || "?"} speakers`;
+}
+
+function parseLabelValue(value) {
+  const trimmed = String(value).trim();
+  if (!trimmed) return "";
+  if (trimmed === "true") return true;
+  if (trimmed === "false") return false;
+  const numeric = Number(trimmed);
+  return Number.isNaN(numeric) ? trimmed : numeric;
+}
+
+function humanize(value) {
+  return String(value || "")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function format(value, suffix = "") {

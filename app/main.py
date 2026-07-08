@@ -9,21 +9,25 @@ from pathlib import Path
 from fastapi import BackgroundTasks, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.analyzer import UPLOAD_DIR, analyze_audio
+from app.labels import create_label, export_training_rows, init_label_db, list_labels
+from app.llm_interpreter import apply_contextualization, interpret_conversation
 from app.recordings import (
     analyze_recording,
     create_recording,
     get_recording,
     init_db,
     list_recordings,
+    save_recording_result,
 )
 
 
 app = FastAPI(title="Conversation Analytics MVP")
 init_db()
+init_label_db()
 
 cors_origins = [
     origin.strip()
@@ -176,6 +180,59 @@ def analyze_existing_recording(recording_id: str, background_tasks: BackgroundTa
     return recording
 
 
+@app.post("/api/recordings/{recording_id}/interpret")
+def interpret_recording(recording_id: str) -> dict:
+    try:
+        recording = get_recording(recording_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Recording not found.") from exc
+
+    if recording["status"] != "complete" or not recording.get("result"):
+        raise HTTPException(status_code=409, detail="Recording must be complete before interpretation.")
+
+    try:
+        result = dict(recording["result"])
+        interpretation = interpret_conversation(result)
+        result["interpretation"] = interpretation
+        result = apply_contextualization(result, interpretation)
+        save_recording_result(recording_id, result)
+        return get_recording(recording_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Interpretation failed: {exc}") from exc
+
+
+@app.get("/api/recordings/{recording_id}/labels")
+def recording_labels(recording_id: str) -> list[dict]:
+    try:
+        get_recording(recording_id, include_result=False)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Recording not found.") from exc
+    return list_labels(recording_id)
+
+
+@app.post("/api/recordings/{recording_id}/labels")
+def add_recording_label(recording_id: str, payload: dict) -> dict:
+    try:
+        return create_label(recording_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Recording not found.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/training/labels")
+def training_labels() -> list[dict]:
+    return export_training_rows()
+
+
+@app.get("/api/training/labels.jsonl")
+def training_labels_jsonl() -> PlainTextResponse:
+    lines = [json_line(row) for row in export_training_rows()]
+    return PlainTextResponse("\n".join(lines) + ("\n" if lines else ""), media_type="application/x-ndjson")
+
+
 @app.post("/api/analyze")
 async def analyze(file: UploadFile = File(...)) -> dict:
     if not file.filename:
@@ -194,3 +251,9 @@ async def analyze(file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}") from exc
+
+
+def json_line(value: dict) -> str:
+    import json
+
+    return json.dumps(value, ensure_ascii=False)

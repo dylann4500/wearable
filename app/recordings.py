@@ -137,6 +137,17 @@ def mark_complete(recording_id: str, result: dict[str, Any]) -> None:
         )
 
 
+def save_recording_result(recording_id: str, result: dict[str, Any]) -> None:
+    recording = get_recording(recording_id, include_result=False)
+    result_path_value = recording.get("result_path")
+    if not result_path_value:
+        raise ValueError("Recording does not have a result to update.")
+    result_path = Path(result_path_value)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    update_recording(recording_id, result_path=str(result_path))
+
+
 def mark_failed(recording_id: str, error: str) -> None:
     update_recording(recording_id, status="failed", error=error[:2000])
 

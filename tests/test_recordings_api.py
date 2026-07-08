@@ -53,6 +53,17 @@ class RecordingApiTest(unittest.TestCase):
             "audio_quality": {},
             "sentiment": {},
             "interjections": {"events": [], "estimated_count": 0},
+            "insights": {
+                "raw_feature_snapshot": {"duration_seconds": 0.1, "turn_count": 0},
+                "scores": {
+                    "warmth": {
+                        "score": 50,
+                        "confidence": 0.2,
+                        "drivers": ["mocked insight"],
+                        "practice": "mock practice",
+                    }
+                },
+            },
             "transcript": [],
         }
         self.client = TestClient(app)
@@ -111,6 +122,52 @@ class RecordingApiTest(unittest.TestCase):
         self.assertEqual(detail["source"], "browser")
         self.assertEqual(detail["status"], "complete")
         self.assertEqual(detail["result"]["metadata"]["file_name"], "browser.wav")
+
+    def test_interpretation_route_persists_context_analysis(self) -> None:
+        response = self.client.post(
+            "/api/recordings",
+            files={"file": ("browser.wav", tiny_wav_bytes(), "audio/wav")},
+        )
+        recording_id = response.json()["id"]
+
+        interpreted = self.client.post(f"/api/recordings/{recording_id}/interpret")
+        payload = interpreted.json()
+
+        self.assertEqual(interpreted.status_code, 200)
+        self.assertIn("interpretation", payload["result"])
+        self.assertIn("context", payload["result"]["interpretation"])
+        self.assertEqual(payload["result"]["interpretation"]["provider"], "mock")
+
+    def test_label_routes_create_and_export_training_rows(self) -> None:
+        response = self.client.post(
+            "/api/recordings",
+            files={"file": ("browser.wav", tiny_wav_bytes(), "audio/wav")},
+        )
+        recording_id = response.json()["id"]
+
+        label = self.client.post(
+            f"/api/recordings/{recording_id}/labels",
+            json={
+                "scope": "conversation",
+                "target": "warmth",
+                "value": 72,
+                "source": "human",
+                "confidence": 0.9,
+                "rationale": "Warm and validating overall.",
+            },
+        )
+        labels = self.client.get(f"/api/recordings/{recording_id}/labels")
+        export = self.client.get("/api/training/labels")
+        jsonl = self.client.get("/api/training/labels.jsonl")
+
+        self.assertEqual(label.status_code, 200)
+        self.assertEqual(label.json()["target"], "warmth")
+        self.assertEqual(labels.status_code, 200)
+        self.assertEqual(len(labels.json()), 1)
+        self.assertEqual(export.status_code, 200)
+        self.assertEqual(export.json()[0]["labels"][0]["target"], "warmth")
+        self.assertEqual(jsonl.status_code, 200)
+        self.assertIn('"target": "warmth"', jsonl.text)
 
 
 class FirmwareHandoffTest(unittest.TestCase):
