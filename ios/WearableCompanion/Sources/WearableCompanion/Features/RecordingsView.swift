@@ -231,6 +231,7 @@ private struct DashboardWearableRecordingRow: View {
         case .queued: "clock"
         case .downloading: "arrow.down.circle"
         case .downloaded: "checkmark.circle.fill"
+        case .failed: "exclamationmark.triangle.fill"
         }
     }
 
@@ -239,6 +240,7 @@ private struct DashboardWearableRecordingRow: View {
         case .onWearable: .secondary
         case .queued, .downloading: .blue
         case .downloaded: .green
+        case .failed: .red
         }
     }
 }

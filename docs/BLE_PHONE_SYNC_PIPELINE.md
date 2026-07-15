@@ -32,8 +32,18 @@ Control commands:
 - `RECORD_START`
 - `RECORD_STOP`
 - `FETCH:<filename>:<offset>`
+- `TRANSFER_READY:<filename>`
+- `TRANSFER_ACK:<filename>:<next-offset>`
 - `TRANSFER_STOP`
 - `MARK_SYNCED:<filename>`
+
+The data characteristic uses an 8-packet sliding window. Each packet contains
+a 32-bit file offset, a 16-bit payload length, and up to 160 payload bytes.
+After each window, the phone acknowledges the next byte it expects. The
+wearable retransmits from that offset after a gap, and reconnects resume from
+the retained `.part` file. `TRANSFER_STARTED` includes the complete-file CRC32;
+the phone validates size, WAV structure, and CRC before atomically committing
+the local `.wav`.
 
 ## iOS App
 
@@ -67,4 +77,9 @@ Bluetooth does not work in the iOS Simulator for real hardware scanning. Use a p
 
 - Wi-Fi upload is disabled by default in `firmware_config.example.h` so BLE testing does not block on network credentials.
 - Files remain on the SD card after phone sync. The firmware writes a `.phone_synced` marker when the iPhone confirms download.
-- The first transfer uses conservative 180-byte BLE payloads. This favors reliability for bring-up; throughput tuning can come later.
+- New recordings are written to a `.recording` temporary path and renamed to
+  `.wav` only after the final header is safely written. The manifest also
+  rejects legacy incomplete WAVs left by an interrupted recording.
+- Transfers use 160-byte payloads with cumulative acknowledgements and
+  backpressure instead of relying on a fixed delay between unacknowledged
+  notifications.

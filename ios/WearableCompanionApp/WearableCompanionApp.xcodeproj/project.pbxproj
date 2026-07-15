@@ -39,6 +39,7 @@
 		A1000000000000000000001C /* BLEAudioModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = BLEAudioModels.swift; path = ../WearableCompanion/Sources/WearableCompanion/BLEAudioModels.swift; sourceTree = SOURCE_ROOT; };
 		A1000000000000000000001D /* WearableBLEManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = WearableBLEManager.swift; path = ../WearableCompanion/Sources/WearableCompanion/WearableBLEManager.swift; sourceTree = SOURCE_ROOT; };
 		A1000000000000000000001E /* AudioPlaybackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AudioPlaybackController.swift; path = ../WearableCompanion/Sources/WearableCompanion/AudioPlaybackController.swift; sourceTree = SOURCE_ROOT; };
+		A1000000000000000000001F /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -55,6 +56,7 @@
 		A10000000000000000000040 = {
 			isa = PBXGroup;
 			children = (
+				A1000000000000000000001F /* Info.plist */,
 				A10000000000000000000041 /* WearableCompanion */,
 				A10000000000000000000042 /* Products */,
 			);
@@ -309,12 +311,16 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 5FWR7995DT;
 				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Wearable Companion";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.healthcare-fitness";
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Wearable Companion uses Bluetooth to find the XIAO wearable, start and stop recordings, and download saved audio.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UIBackgroundModes = (
+					"bluetooth-central",
+				);
 				INFOPLIST_KEY_UIFileSharingEnabled = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
@@ -344,12 +350,16 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 5FWR7995DT;
 				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Wearable Companion";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.healthcare-fitness";
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Wearable Companion uses Bluetooth to find the XIAO wearable, start and stop recordings, and download saved audio.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UIBackgroundModes = (
+					"bluetooth-central",
+				);
 				INFOPLIST_KEY_UIFileSharingEnabled = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";

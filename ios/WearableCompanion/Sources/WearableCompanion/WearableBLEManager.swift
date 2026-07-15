@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import OSLog
 
 #if canImport(CoreBluetooth)
 import CoreBluetooth
@@ -25,11 +26,20 @@ final class WearableBLEManager: NSObject {
     private var manifestPollingTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var downloadWatchdogTask: Task<Void, Never>?
+    private var requestWatchdogTask: Task<Void, Never>?
     private var downloadQueue: [String] = []
     private var downloadRetryCounts: [String: Int] = [:]
+    private var terminalDownloadFailures: Set<String> = []
+    private var pendingDownloadFilename: String?
+    private var controlCommandQueue: [Data] = []
+    private var controlWriteInFlight = false
     private var statusNotificationsReady = false
     private var dataNotificationsReady = false
     private var protocolStarted = false
+    private let acknowledgementWindowPackets = 8
+    private let diskBufferSize = 32 * 1024
+    private let maximumDownloadRetries = 3
+    private let logger = Logger(subsystem: "com.example.WearableCompanion", category: "BLE")
 
     var state: WearableConnectionState = .idle
     var discoveredDevices: [WearablePeripheral] = []
@@ -67,14 +77,16 @@ final class WearableBLEManager: NSObject {
     }
 
     func startAutoSyncNearest() {
+        autoSyncNearestEnabled = true
+        isAutoSyncing = true
+        guard central.state == .poweredOn else { return }
         guard !isConnected else {
-            autoSyncNearestEnabled = true
             beginManifestPolling()
             refreshRecordings()
             return
         }
-        autoSyncNearestEnabled = true
-        isAutoSyncing = true
+        if case .scanning = state { return }
+        if case .connecting = state { return }
         appendStatus("AUTO_SYNC:Scanning for nearest wearable")
         startScan()
         scheduleNearestAutoConnect()
@@ -91,13 +103,16 @@ final class WearableBLEManager: NSObject {
         reconnectTask = nil
         downloadQueue = []
         stopScan()
-        if activeDownload != nil {
+        if activeDownload != nil || pendingDownloadFilename != nil {
             writeCommand("TRANSFER_STOP")
+            cancelCurrentDownload(keepPartialFile: true)
         }
         appendStatus("AUTO_SYNC:Stopped")
     }
 
     func connect(to device: WearablePeripheral) {
+        guard !isConnected else { return }
+        if case .connecting = state { return }
         guard let peripheral = discoveredPeripherals[device.id] else { return }
         state = .connecting(device.name)
         central.stopScan()
@@ -125,6 +140,7 @@ final class WearableBLEManager: NSObject {
 
     func download(_ recording: WearableAudioRecording) {
         downloadRetryCounts[recording.filename] = 0
+        terminalDownloadFailures.remove(recording.filename)
         enqueueDownloads([recording.filename], replaceQueue: true, skipLocalFiles: false)
     }
 
@@ -139,7 +155,12 @@ final class WearableBLEManager: NSObject {
         if activeDownload?.filename == recording.filename {
             return .downloading(downloadProgress[recording.filename] ?? 0)
         }
-        if downloadQueue.contains(recording.filename) || downloadProgress[recording.filename] == 0 {
+        if terminalDownloadFailures.contains(recording.filename) {
+            return .failed
+        }
+        if pendingDownloadFilename == recording.filename
+            || downloadQueue.contains(recording.filename)
+            || downloadProgress[recording.filename] == 0 {
             return .queued
         }
         return .onWearable
@@ -151,14 +172,37 @@ final class WearableBLEManager: NSObject {
     }
 
     private func writeCommand(_ command: String) {
-        guard let peripheral = connectedPeripheral, let controlCharacteristic else {
+        guard connectedPeripheral != nil, controlCharacteristic != nil else {
             appendStatus("ERROR:Not connected")
             return
         }
 
         guard let data = command.data(using: .utf8) else { return }
-        let writeType: CBCharacteristicWriteType = controlCharacteristic.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
-        peripheral.writeValue(data, for: controlCharacteristic, type: writeType)
+        controlCommandQueue.append(data)
+        sendNextControlCommandIfPossible()
+    }
+
+    private func sendNextControlCommandIfPossible() {
+        guard !controlWriteInFlight,
+              !controlCommandQueue.isEmpty,
+              let peripheral = connectedPeripheral,
+              let controlCharacteristic
+        else { return }
+
+        let data = controlCommandQueue.removeFirst()
+        if controlCharacteristic.properties.contains(.write) {
+            controlWriteInFlight = true
+            peripheral.writeValue(data, for: controlCharacteristic, type: .withResponse)
+        } else if controlCharacteristic.properties.contains(.writeWithoutResponse) {
+            guard peripheral.canSendWriteWithoutResponse else {
+                controlCommandQueue.insert(data, at: 0)
+                return
+            }
+            peripheral.writeValue(data, for: controlCharacteristic, type: .withoutResponse)
+            sendNextControlCommandIfPossible()
+        } else {
+            appendStatus("ERROR:Control characteristic is not writable")
+        }
     }
 
     private func scheduleNearestAutoConnect() {
@@ -167,6 +211,8 @@ final class WearableBLEManager: NSObject {
             try? await Task.sleep(for: .seconds(2))
             await MainActor.run {
                 guard let self, self.autoSyncNearestEnabled else { return }
+                self.autoConnectTask = nil
+                guard case .scanning = self.state else { return }
                 guard let nearest = self.discoveredDevices.max(by: { $0.rssi < $1.rssi }) else {
                     self.appendStatus("AUTO_SYNC:No wearable found")
                     self.isAutoSyncing = false
@@ -180,6 +226,10 @@ final class WearableBLEManager: NSObject {
     }
 
     private func appendStatus(_ status: String) {
+        logger.info("\(status, privacy: .public)")
+        #if DEBUG
+        print("[BLE] \(status)")
+        #endif
         statusLog.insert(status, at: 0)
         statusLog = Array(statusLog.prefix(20))
     }
@@ -215,17 +265,30 @@ final class WearableBLEManager: NSObject {
         }
 
         if status.hasPrefix("TRANSFER_DONE:") {
-            finishLocalDownload(from: status)
+            if let activeDownload, activeDownload.receivedBytes == activeDownload.totalBytes {
+                finishLocalDownload()
+            }
             return
         }
 
         if status.hasPrefix("TRANSFER_ERROR:") || status.hasPrefix("TRANSFER_STOPPED:") {
-            failActiveDownload(reason: status)
+            failCurrentDownload(reason: status, keepPartialFile: true)
+            return
+        }
+
+        if status.hasPrefix("ERROR:") || status.hasPrefix("BUSY:") {
+            if activeDownload != nil || pendingDownloadFilename != nil {
+                failCurrentDownload(reason: status, keepPartialFile: true)
+            }
         }
     }
 
     private func handleManifest(_ data: Data) {
         guard let text = String(data: data, encoding: .utf8) else { return }
+        if text.hasPrefix("ERROR|") {
+            appendStatus("ERROR:\(text.replacingOccurrences(of: "|", with: ":"))")
+            return
+        }
 
         let remoteRecordings: [WearableAudioRecording] = text
             .split(separator: "\n")
@@ -248,7 +311,7 @@ final class WearableBLEManager: NSObject {
 
         if autoSyncNearestEnabled {
             let missingFilenames = recordings
-                .filter { $0.localFileURL == nil }
+                .filter { $0.localFileURL == nil && !terminalDownloadFailures.contains($0.filename) }
                 .map(\.filename)
             enqueueDownloads(missingFilenames, replaceQueue: true, skipLocalFiles: true)
         }
@@ -257,6 +320,8 @@ final class WearableBLEManager: NSObject {
     private func enqueueDownloads(_ filenames: [String], replaceQueue: Bool, skipLocalFiles: Bool) {
         let pending = filenames.filter { filename in
             guard activeDownload?.filename != filename else { return false }
+            guard pendingDownloadFilename != filename else { return false }
+            guard !terminalDownloadFailures.contains(filename) else { return false }
             return recordings.contains(where: { recording in
                 recording.filename == filename && (!skipLocalFiles || recording.localFileURL == nil)
             })
@@ -272,7 +337,8 @@ final class WearableBLEManager: NSObject {
     }
 
     private func startNextDownloadIfNeeded() {
-        guard activeDownload == nil else { return }
+        guard isConnected, protocolStarted else { return }
+        guard activeDownload == nil, pendingDownloadFilename == nil else { return }
         guard let filename = downloadQueue.first else {
             if isAutoSyncing {
                 appendStatus("AUTO_SYNC:Complete")
@@ -282,108 +348,212 @@ final class WearableBLEManager: NSObject {
         }
 
         downloadQueue.removeFirst()
-        downloadProgress[filename] = 0
-        writeCommand("FETCH:\(filename):0")
+        let offset = partialDownloadOffset(for: filename)
+        pendingDownloadFilename = filename
+        downloadProgress[filename] = progress(filename: filename, receivedBytes: offset)
+        writeCommand("FETCH:\(filename):\(offset)")
+        scheduleRequestWatchdog(for: filename)
     }
 
     private func startLocalDownload(from status: String) {
         let parts = status.split(separator: ":")
-        guard parts.count >= 4, let totalBytes = Int(parts[2]) else { return }
-        let filename = String(parts[1])
-        do {
-            guard let fileURL = Self.localAudioURL(filename: filename, existsOnly: false) else {
-                appendStatus("ERROR:Cannot access documents directory")
-                return
-            }
-            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                try FileManager.default.removeItem(at: fileURL)
-            }
-            guard FileManager.default.createFile(atPath: fileURL.path, contents: nil) else {
-                appendStatus("ERROR:Cannot create local audio file")
-                return
-            }
-            let handle = try FileHandle(forWritingTo: fileURL)
-            activeDownload = ActiveDownload(filename: filename, totalBytes: totalBytes, fileURL: fileURL, fileHandle: handle, receivedBytes: 0)
-            downloadProgress[filename] = 0
-            scheduleDownloadWatchdog()
-            writeCommand("TRANSFER_READY:\(filename)")
-        } catch {
-            appendStatus("ERROR:Cannot create local file: \(error.localizedDescription)")
+        guard parts.count >= 5,
+              let totalBytes = Int(parts[2]),
+              let requestedOffset = Int(parts[3]),
+              let expectedCRC32 = UInt32(parts[4])
+        else {
+            failCurrentDownload(reason: "TRANSFER_ERROR:Malformed start status", keepPartialFile: false)
+            return
         }
-    }
-
-    private func handleTransferData(_ data: Data) {
-        guard var activeDownload, data.count >= 6 else { return }
-        let packetOffset = Int(
-            UInt32(data[0])
-                | UInt32(data[1]) << 8
-                | UInt32(data[2]) << 16
-                | UInt32(data[3]) << 24
-        )
-        let payloadLength = Int(UInt16(data[4]) | UInt16(data[5]) << 8)
-        guard data.count >= 6 + payloadLength else { return }
-        guard !activeDownload.isCorrupted else { return }
-        guard packetOffset == activeDownload.receivedBytes else {
-            activeDownload.isCorrupted = true
-            self.activeDownload = activeDownload
-            appendStatus("TRANSFER_GAP:\(activeDownload.filename):expected \(activeDownload.receivedBytes):received \(packetOffset)")
+        let filename = String(parts[1])
+        guard pendingDownloadFilename == filename else {
+            appendStatus("TRANSFER_IGNORED:Unexpected start for \(filename)")
             writeCommand("TRANSFER_STOP")
             return
         }
 
-        let payload = data.subdata(in: 6..<(6 + payloadLength))
+        requestWatchdogTask?.cancel()
+        requestWatchdogTask = nil
         do {
-            try activeDownload.fileHandle.write(contentsOf: payload)
-            activeDownload.receivedBytes += payloadLength
-            self.activeDownload = activeDownload
-            downloadProgress[activeDownload.filename] = min(1, Double(activeDownload.receivedBytes) / Double(activeDownload.totalBytes))
+            guard let finalFileURL = Self.localAudioURL(filename: filename, existsOnly: false),
+                  let partialFileURL = Self.partialAudioURL(filename: filename)
+            else {
+                appendStatus("ERROR:Cannot access documents directory")
+                pendingDownloadFilename = nil
+                return
+            }
+
+            try FileManager.default.createDirectory(
+                at: partialFileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let existingSize = Self.fileSize(at: partialFileURL)
+            guard existingSize == requestedOffset else {
+                try? FileManager.default.removeItem(at: partialFileURL)
+                pendingDownloadFilename = nil
+                writeCommand("TRANSFER_STOP")
+                scheduleRetry(filename: filename, reason: "TRANSFER_ERROR:Resume offset mismatch", keepPartialFile: false)
+                return
+            }
+
+            if requestedOffset == 0, FileManager.default.fileExists(atPath: partialFileURL.path) {
+                try FileManager.default.removeItem(at: partialFileURL)
+            }
+            if !FileManager.default.fileExists(atPath: partialFileURL.path),
+               !FileManager.default.createFile(atPath: partialFileURL.path, contents: nil) {
+                appendStatus("ERROR:Cannot create local audio file")
+                pendingDownloadFilename = nil
+                return
+            }
+
+            let handle = try FileHandle(forWritingTo: partialFileURL)
+            try handle.seekToEnd()
+            activeDownload = ActiveDownload(
+                filename: filename,
+                totalBytes: totalBytes,
+                expectedCRC32: expectedCRC32,
+                partialFileURL: partialFileURL,
+                finalFileURL: finalFileURL,
+                fileHandle: handle,
+                receivedBytes: requestedOffset,
+                unflushedData: Data(),
+                packetsSinceAcknowledgement: 0,
+                lastPublishedBytes: requestedOffset
+            )
+            pendingDownloadFilename = nil
+            downloadProgress[filename] = progress(filename: filename, receivedBytes: requestedOffset)
             scheduleDownloadWatchdog()
+            writeCommand("TRANSFER_READY:\(filename)")
         } catch {
-            appendStatus("ERROR:Write failed: \(error.localizedDescription)")
+            pendingDownloadFilename = nil
+            appendStatus("ERROR:Cannot create local file: \(error.localizedDescription)")
+            scheduleRetry(filename: filename, reason: "TRANSFER_ERROR:Local file setup failed", keepPartialFile: false)
         }
     }
 
-    private func finishLocalDownload(from status: String) {
-        guard let activeDownload else { return }
+    private func handleTransferData(_ data: Data) {
+        guard var activeDownload, let packet = BLEDataPacket(data: data) else { return }
+
+        if packet.offset < activeDownload.receivedBytes {
+            writeCommand("TRANSFER_ACK:\(activeDownload.filename):\(activeDownload.receivedBytes)")
+            return
+        }
+        guard packet.offset == activeDownload.receivedBytes else {
+            appendStatus(
+                "TRANSFER_GAP:\(activeDownload.filename):expected \(activeDownload.receivedBytes):received \(packet.offset)"
+            )
+            writeCommand("TRANSFER_ACK:\(activeDownload.filename):\(activeDownload.receivedBytes)")
+            return
+        }
+        guard activeDownload.receivedBytes + packet.payload.count <= activeDownload.totalBytes else {
+            failCurrentDownload(reason: "TRANSFER_ERROR:Payload exceeds declared file size", keepPartialFile: false)
+            return
+        }
+
+        do {
+            activeDownload.unflushedData.append(packet.payload)
+            activeDownload.receivedBytes += packet.payload.count
+            activeDownload.packetsSinceAcknowledgement += 1
+
+            if activeDownload.unflushedData.count >= diskBufferSize
+                || activeDownload.receivedBytes == activeDownload.totalBytes {
+                try flushBufferedData(&activeDownload)
+            }
+
+            if activeDownload.receivedBytes - activeDownload.lastPublishedBytes >= 4 * 1024
+                || activeDownload.receivedBytes == activeDownload.totalBytes {
+                activeDownload.lastPublishedBytes = activeDownload.receivedBytes
+                downloadProgress[activeDownload.filename] = min(
+                    1,
+                    Double(activeDownload.receivedBytes) / Double(activeDownload.totalBytes)
+                )
+            }
+
+            let shouldAcknowledge = activeDownload.packetsSinceAcknowledgement >= acknowledgementWindowPackets
+                || activeDownload.receivedBytes == activeDownload.totalBytes
+            if shouldAcknowledge {
+                activeDownload.packetsSinceAcknowledgement = 0
+                writeCommand("TRANSFER_ACK:\(activeDownload.filename):\(activeDownload.receivedBytes)")
+            }
+
+            self.activeDownload = activeDownload
+            scheduleDownloadWatchdog()
+
+            if activeDownload.receivedBytes == activeDownload.totalBytes {
+                finishLocalDownload()
+            }
+        } catch {
+            failCurrentDownload(
+                reason: "TRANSFER_ERROR:Write failed: \(error.localizedDescription)",
+                keepPartialFile: false
+            )
+        }
+    }
+
+    private func flushBufferedData(_ activeDownload: inout ActiveDownload) throws {
+        guard !activeDownload.unflushedData.isEmpty else { return }
+        try activeDownload.fileHandle.write(contentsOf: activeDownload.unflushedData)
+        activeDownload.unflushedData.removeAll(keepingCapacity: true)
+    }
+
+    private func finishLocalDownload() {
+        guard var activeDownload else { return }
         downloadWatchdogTask?.cancel()
         downloadWatchdogTask = nil
         do {
+            try flushBufferedData(&activeDownload)
             try activeDownload.fileHandle.close()
         } catch {
-            appendStatus("ERROR:Close failed: \(error.localizedDescription)")
+            failCurrentDownload(
+                reason: "TRANSFER_ERROR:Close failed: \(error.localizedDescription)",
+                keepPartialFile: false
+            )
+            return
         }
 
-        let isComplete = !activeDownload.isCorrupted
-            && activeDownload.receivedBytes == activeDownload.totalBytes
-            && Self.isValidWAV(at: activeDownload.fileURL, expectedSize: activeDownload.totalBytes)
+        let actualCRC32 = CRC32.checksum(fileAt: activeDownload.partialFileURL)
+        let isComplete = activeDownload.receivedBytes == activeDownload.totalBytes
+            && Self.isValidWAV(at: activeDownload.partialFileURL, expectedSize: activeDownload.totalBytes)
+            && actualCRC32 == activeDownload.expectedCRC32
 
         guard isComplete else {
-            try? FileManager.default.removeItem(at: activeDownload.fileURL)
-            downloadProgress[activeDownload.filename] = 0
             self.activeDownload = nil
+            try? FileManager.default.removeItem(at: activeDownload.partialFileURL)
+            scheduleRetry(
+                filename: activeDownload.filename,
+                reason: "TRANSFER_ERROR:WAV or CRC validation failed",
+                keepPartialFile: false
+            )
+            return
+        }
 
-            let retryCount = downloadRetryCounts[activeDownload.filename, default: 0]
-            if retryCount < 2 {
-                downloadRetryCounts[activeDownload.filename] = retryCount + 1
-                downloadQueue.insert(activeDownload.filename, at: 0)
-                appendStatus("TRANSFER_RETRY:\(activeDownload.filename)")
-            } else {
-                downloadProgress[activeDownload.filename] = nil
-                appendStatus("ERROR:Transfer validation failed for \(activeDownload.filename)")
+        do {
+            if FileManager.default.fileExists(atPath: activeDownload.finalFileURL.path) {
+                try FileManager.default.removeItem(at: activeDownload.finalFileURL)
             }
-            startNextDownloadIfNeeded()
+            try FileManager.default.moveItem(
+                at: activeDownload.partialFileURL,
+                to: activeDownload.finalFileURL
+            )
+        } catch {
+            self.activeDownload = nil
+            scheduleRetry(
+                filename: activeDownload.filename,
+                reason: "TRANSFER_ERROR:Cannot commit downloaded file",
+                keepPartialFile: true
+            )
             return
         }
 
         recordings = recordings.map { recording in
             guard recording.filename == activeDownload.filename else { return recording }
             var updated = recording
-            updated.localFileURL = activeDownload.fileURL
+            updated.localFileURL = activeDownload.finalFileURL
             return updated
         }
         downloadProgress[activeDownload.filename] = 1
         downloadRetryCounts[activeDownload.filename] = nil
+        terminalDownloadFailures.remove(activeDownload.filename)
         writeCommand("MARK_SYNCED:\(activeDownload.filename)")
         self.activeDownload = nil
         startNextDownloadIfNeeded()
@@ -403,37 +573,79 @@ final class WearableBLEManager: NSObject {
                       current.receivedBytes == receivedBytes
                 else { return }
                 self.writeCommand("TRANSFER_STOP")
-                self.failActiveDownload(reason: "TRANSFER_TIMEOUT:\(filename)")
+                self.failCurrentDownload(reason: "TRANSFER_TIMEOUT:\(filename)", keepPartialFile: true)
             }
         }
     }
 
-    private func failActiveDownload(reason: String) {
-        guard let activeDownload else { return }
+    private func scheduleRequestWatchdog(for filename: String) {
+        requestWatchdogTask?.cancel()
+        requestWatchdogTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            await MainActor.run {
+                guard let self, self.pendingDownloadFilename == filename else { return }
+                self.failCurrentDownload(
+                    reason: "TRANSFER_REQUEST_TIMEOUT:\(filename)",
+                    keepPartialFile: true
+                )
+            }
+        }
+    }
+
+    private func failCurrentDownload(reason: String, keepPartialFile: Bool) {
+        let filename = activeDownload?.filename ?? pendingDownloadFilename
+        guard let filename else { return }
+        writeCommand("TRANSFER_STOP")
+        cancelCurrentDownload(keepPartialFile: keepPartialFile)
+        scheduleRetry(filename: filename, reason: reason, keepPartialFile: keepPartialFile)
+    }
+
+    private func cancelCurrentDownload(keepPartialFile: Bool) {
         downloadWatchdogTask?.cancel()
         downloadWatchdogTask = nil
-        try? activeDownload.fileHandle.close()
-        try? FileManager.default.removeItem(at: activeDownload.fileURL)
+        requestWatchdogTask?.cancel()
+        requestWatchdogTask = nil
+        if let activeDownload {
+            var download = activeDownload
+            try? flushBufferedData(&download)
+            try? download.fileHandle.close()
+            if !keepPartialFile {
+                try? FileManager.default.removeItem(at: download.partialFileURL)
+            }
+        }
         self.activeDownload = nil
-        downloadProgress[activeDownload.filename] = 0
+        pendingDownloadFilename = nil
+    }
 
-        let retryCount = downloadRetryCounts[activeDownload.filename, default: 0]
-        if retryCount < 2 {
-            downloadRetryCounts[activeDownload.filename] = retryCount + 1
+    private func scheduleRetry(filename: String, reason: String, keepPartialFile: Bool) {
+        if !keepPartialFile, let partialURL = Self.partialAudioURL(filename: filename) {
+            try? FileManager.default.removeItem(at: partialURL)
+        }
+
+        let retryCount = downloadRetryCounts[filename, default: 0]
+        if retryCount < maximumDownloadRetries {
+            downloadRetryCounts[filename] = retryCount + 1
+            downloadProgress[filename] = progress(
+                filename: filename,
+                receivedBytes: partialDownloadOffset(for: filename)
+            )
             appendStatus("\(reason):Retrying")
-            let filename = activeDownload.filename
             Task { [weak self] in
-                try? await Task.sleep(for: .milliseconds(750))
+                try? await Task.sleep(for: .seconds(1))
                 await MainActor.run {
                     guard let self else { return }
-                    self.enqueueDownloads([filename], replaceQueue: false, skipLocalFiles: true)
+                    if !self.downloadQueue.contains(filename) {
+                        self.downloadQueue.insert(filename, at: 0)
+                    }
+                    self.startNextDownloadIfNeeded()
                 }
             }
         } else {
-            downloadProgress[activeDownload.filename] = nil
+            terminalDownloadFailures.insert(filename)
+            downloadProgress[filename] = nil
             appendStatus("\(reason):Retry limit reached")
+            startNextDownloadIfNeeded()
         }
-        startNextDownloadIfNeeded()
     }
 
     private func beginProtocolIfReady() {
@@ -445,16 +657,22 @@ final class WearableBLEManager: NSObject {
         protocolStarted = true
         writeCommand("PING")
         refreshRecordings()
+        beginManifestPolling()
     }
 
     private func beginManifestPolling() {
         manifestPollingTask?.cancel()
         manifestPollingTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(3))
+                try? await Task.sleep(for: .seconds(10))
                 guard !Task.isCancelled else { return }
                 await MainActor.run {
-                    guard let self, self.autoSyncNearestEnabled, self.isConnected else { return }
+                    guard let self,
+                          self.autoSyncNearestEnabled,
+                          self.isConnected,
+                          self.activeDownload == nil,
+                          self.pendingDownloadFilename == nil
+                    else { return }
                     self.refreshRecordings()
                 }
             }
@@ -471,6 +689,26 @@ final class WearableBLEManager: NSObject {
                 self.startAutoSyncNearest()
             }
         }
+    }
+
+    private func partialDownloadOffset(for filename: String) -> Int {
+        guard let recording = recordings.first(where: { $0.filename == filename }),
+              let partialURL = Self.partialAudioURL(filename: filename)
+        else { return 0 }
+
+        let size = Self.fileSize(at: partialURL)
+        guard size >= 0, size < recording.byteSize else {
+            try? FileManager.default.removeItem(at: partialURL)
+            return 0
+        }
+        return size
+    }
+
+    private func progress(filename: String, receivedBytes: Int) -> Double {
+        guard let totalBytes = recordings.first(where: { $0.filename == filename })?.byteSize,
+              totalBytes > 0
+        else { return 0 }
+        return min(1, Double(receivedBytes) / Double(totalBytes))
     }
 
     private static func loadLocalRecordings() -> [WearableAudioRecording] {
@@ -545,11 +783,22 @@ final class WearableBLEManager: NSObject {
         }
         return url
     }
+
+    private static func partialAudioURL(filename: String) -> URL? {
+        localAudioURL(filename: "\(filename).part", existsOnly: false)
+    }
+
+    private static func fileSize(at url: URL) -> Int {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber
+        else { return 0 }
+        return size.intValue
+    }
 }
 
 extension WearableBLEManager: CBCentralManagerDelegate {
     nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        Task { @MainActor in
+        MainActor.assumeIsolated {
             if central.state == .poweredOn {
                 if case .failed = state {
                     state = .idle
@@ -564,7 +813,7 @@ extension WearableBLEManager: CBCentralManagerDelegate {
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        Task { @MainActor in
+        MainActor.assumeIsolated {
             let name = peripheral.name
                 ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String
                 ?? "XIAO Wearable"
@@ -576,39 +825,55 @@ extension WearableBLEManager: CBCentralManagerDelegate {
                 discoveredDevices.append(device)
             }
 
-            if autoSyncNearestEnabled {
+            if autoSyncNearestEnabled, case .scanning = state {
                 scheduleNearestAutoConnect()
             }
         }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        Task { @MainActor in
+        MainActor.assumeIsolated {
             state = .connected(peripheral.name ?? "Wearable")
+            autoConnectTask?.cancel()
+            autoConnectTask = nil
+            controlCommandQueue = []
+            controlWriteInFlight = false
             statusNotificationsReady = false
             dataNotificationsReady = false
             protocolStarted = false
             reconnectTask?.cancel()
             reconnectTask = nil
-            beginManifestPolling()
             peripheral.discoverServices([serviceUUID])
         }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        Task { @MainActor in
+        MainActor.assumeIsolated {
             state = .failed(error?.localizedDescription ?? "Could not connect.")
+            connectedPeripheral = nil
             scheduleReconnect()
         }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        Task { @MainActor in
+        MainActor.assumeIsolated {
+            let interruptedFilename = activeDownload?.filename ?? pendingDownloadFilename
+            cancelCurrentDownload(keepPartialFile: true)
+            if let interruptedFilename,
+               !terminalDownloadFailures.contains(interruptedFilename),
+               !downloadQueue.contains(interruptedFilename) {
+                downloadQueue.insert(interruptedFilename, at: 0)
+            }
             state = error.map { .failed($0.localizedDescription) } ?? .disconnected
             manifestPollingTask?.cancel()
             manifestPollingTask = nil
-            downloadWatchdogTask?.cancel()
-            downloadWatchdogTask = nil
+            controlCommandQueue = []
+            controlWriteInFlight = false
+            controlCharacteristic = nil
+            statusCharacteristic = nil
+            manifestCharacteristic = nil
+            dataCharacteristic = nil
+            connectedPeripheral = nil
             statusNotificationsReady = false
             dataNotificationsReady = false
             protocolStarted = false
@@ -619,7 +884,7 @@ extension WearableBLEManager: CBCentralManagerDelegate {
 
 extension WearableBLEManager: CBPeripheralDelegate {
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        Task { @MainActor in
+        MainActor.assumeIsolated {
             if let error {
                 state = .failed(error.localizedDescription)
                 return
@@ -632,7 +897,7 @@ extension WearableBLEManager: CBPeripheralDelegate {
     }
 
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        Task { @MainActor in
+        MainActor.assumeIsolated {
             if let error {
                 state = .failed(error.localizedDescription)
                 return
@@ -661,7 +926,7 @@ extension WearableBLEManager: CBPeripheralDelegate {
     }
 
     nonisolated func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
-        Task { @MainActor in
+        MainActor.assumeIsolated {
             if let error {
                 appendStatus("ERROR:Notification setup failed: \(error.localizedDescription)")
                 return
@@ -677,7 +942,7 @@ extension WearableBLEManager: CBPeripheralDelegate {
     }
 
     nonisolated func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        Task { @MainActor in
+        MainActor.assumeIsolated {
             if let error {
                 appendStatus("ERROR:\(error.localizedDescription)")
                 return
@@ -698,15 +963,35 @@ extension WearableBLEManager: CBPeripheralDelegate {
             }
         }
     }
+
+    nonisolated func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        MainActor.assumeIsolated {
+            if let error {
+                appendStatus("ERROR:Control write failed: \(error.localizedDescription)")
+            }
+            controlWriteInFlight = false
+            sendNextControlCommandIfPossible()
+        }
+    }
+
+    nonisolated func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        MainActor.assumeIsolated {
+            sendNextControlCommandIfPossible()
+        }
+    }
 }
 
 private struct ActiveDownload {
     var filename: String
     var totalBytes: Int
-    var fileURL: URL
+    var expectedCRC32: UInt32
+    var partialFileURL: URL
+    var finalFileURL: URL
     var fileHandle: FileHandle
     var receivedBytes: Int
-    var isCorrupted = false
+    var unflushedData: Data
+    var packetsSinceAcknowledgement: Int
+    var lastPublishedBytes: Int
 }
 
 private extension CBManagerState {

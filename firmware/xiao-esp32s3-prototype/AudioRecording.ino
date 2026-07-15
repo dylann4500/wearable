@@ -55,6 +55,9 @@ const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 // iOS commonly negotiates a 185-byte ATT MTU, leaving 182 bytes for a
 // characteristic value. Reserve 6 bytes for our offset/length header.
 const size_t BLE_TRANSFER_CHUNK_SIZE = 160;
+const uint8_t BLE_TRANSFER_WINDOW_CHUNKS = 8;
+const unsigned long BLE_TRANSFER_ACK_TIMEOUT_MS = 5000;
+const uint8_t BLE_TRANSFER_WINDOW_RETRY_LIMIT = 5;
 
 // -------------------- BLE settings --------------------
 
@@ -76,6 +79,8 @@ volatile bool bleRecordingRequested = false;
 volatile bool bleClientConnected = false;
 volatile bool bleTransferInProgress = false;
 volatile bool bleTransferReceiverReady = false;
+volatile bool bleTransferAckReceived = false;
+volatile uint32_t bleTransferAckOffset = 0;
 volatile bool storageReady = false;
 TaskHandle_t bleRecordTaskHandle = nullptr;
 TaskHandle_t bleTransferTaskHandle = nullptr;
@@ -97,6 +102,7 @@ bool tryRecoverStorage() {
   if (!makeAudioDirectoryIfNeeded()) {
     return false;
   }
+  cleanupTemporaryRecordings();
 
   storageReady = true;
   Serial.println("MicroSD storage ready.");
@@ -240,6 +246,30 @@ void clearAudioDirectory() {
 
   publishRecordingManifest();
   Serial.printf("CLEAR_RECORDINGS_DONE:%d\n", removedCount);
+}
+
+void cleanupTemporaryRecordings() {
+  File dir = SD.open(AUDIO_DIR);
+  if (!dir || !dir.isDirectory()) {
+    return;
+  }
+
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      break;
+    }
+
+    String path = normalizeAudioPath(String(entry.name()));
+    bool isDirectory = entry.isDirectory();
+    entry.close();
+    if (!isDirectory && hasSuffix(path, ".recording")) {
+      if (SD.remove(path)) {
+        Serial.printf("Removed incomplete temporary recording: %s\n", path.c_str());
+      }
+    }
+  }
+  dir.close();
 }
 
 String getNextAudioFileName() {
@@ -444,6 +474,65 @@ String recordingPathFromName(String filename) {
   return String(AUDIO_DIR) + "/" + filename;
 }
 
+uint32_t readUint32LE(const uint8_t *buffer) {
+  return (uint32_t)buffer[0]
+    | ((uint32_t)buffer[1] << 8)
+    | ((uint32_t)buffer[2] << 16)
+    | ((uint32_t)buffer[3] << 24);
+}
+
+bool isFinalizedWAV(String path, size_t expectedSize) {
+  if (expectedSize <= WAV_HEADER_SIZE) {
+    return false;
+  }
+
+  File file = SD.open(path, FILE_READ);
+  if (!file) {
+    return false;
+  }
+
+  uint8_t header[WAV_HEADER_SIZE];
+  size_t bytesRead = file.read(header, sizeof(header));
+  file.close();
+  if (bytesRead != sizeof(header)
+      || memcmp(header, "RIFF", 4) != 0
+      || memcmp(header + 8, "WAVE", 4) != 0
+      || memcmp(header + 36, "data", 4) != 0) {
+    return false;
+  }
+
+  uint32_t riffSize = readUint32LE(header + 4);
+  uint32_t dataSize = readUint32LE(header + 40);
+  uint32_t expectedRiffSize = expectedSize - 8;
+  uint32_t expectedDataSize = expectedSize - WAV_HEADER_SIZE;
+  if (riffSize == expectedRiffSize && dataSize == expectedDataSize) {
+    return true;
+  }
+
+  header[4] = expectedRiffSize & 0xFF;
+  header[5] = (expectedRiffSize >> 8) & 0xFF;
+  header[6] = (expectedRiffSize >> 16) & 0xFF;
+  header[7] = (expectedRiffSize >> 24) & 0xFF;
+  header[40] = expectedDataSize & 0xFF;
+  header[41] = (expectedDataSize >> 8) & 0xFF;
+  header[42] = (expectedDataSize >> 16) & 0xFF;
+  header[43] = (expectedDataSize >> 24) & 0xFF;
+
+  File repairFile = SD.open(path, FILE_WRITE);
+  if (!repairFile || !repairFile.seek(0)) {
+    if (repairFile) {
+      repairFile.close();
+    }
+    return false;
+  }
+  bool repaired = repairFile.write(header, sizeof(header)) == sizeof(header);
+  repairFile.close();
+  if (repaired) {
+    Serial.printf("Repaired interrupted WAV header: %s\n", path.c_str());
+  }
+  return repaired;
+}
+
 String buildRecordingManifest() {
   String manifest = "";
   File dir = SD.open(AUDIO_DIR);
@@ -470,6 +559,10 @@ String buildRecordingManifest() {
     if (audioFileName == bleActiveRecordingPath) {
       continue;
     }
+    if (!isFinalizedWAV(audioFileName, size)) {
+      Serial.printf("Skipping incomplete WAV in manifest: %s\n", audioFileName.c_str());
+      continue;
+    }
 
     String syncedMarker = String(audioFileName) + ".phone_synced";
     manifest += baseName(audioFileName);
@@ -485,7 +578,22 @@ String buildRecordingManifest() {
 }
 
 void publishRecordingManifest() {
+  if (!storageReady) {
+    if (bleManifestCharacteristic != nullptr) {
+      bleManifestCharacteristic->setValue("");
+    }
+    bleNotifyStatus("ERROR:SD card unavailable");
+    return;
+  }
+
   String manifest = buildRecordingManifest();
+  if (manifest.startsWith("ERROR|")) {
+    if (bleManifestCharacteristic != nullptr) {
+      bleManifestCharacteristic->setValue("");
+    }
+    bleNotifyStatus("ERROR:Cannot open /Audio");
+    return;
+  }
   if (bleManifestCharacteristic != nullptr) {
     bleManifestCharacteristic->setValue(manifest.c_str());
   }
@@ -518,6 +626,33 @@ void writeUint16LE(uint8_t *buffer, uint16_t value) {
   buffer[1] = (value >> 8) & 0xFF;
 }
 
+uint32_t updateCRC32(uint32_t crc, const uint8_t *data, size_t length) {
+  for (size_t index = 0; index < length; index++) {
+    crc ^= data[index];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc >> 1) ^ (0xEDB88320U & (0U - (crc & 1U)));
+    }
+  }
+  return crc;
+}
+
+uint32_t calculateFileCRC32(File &file) {
+  uint32_t originalPosition = file.position();
+  uint32_t crc = 0xFFFFFFFFU;
+  uint8_t buffer[512];
+
+  file.seek(0);
+  while (file.available()) {
+    size_t bytesRead = file.read(buffer, sizeof(buffer));
+    if (bytesRead == 0) {
+      break;
+    }
+    crc = updateCRC32(crc, buffer, bytesRead);
+  }
+  file.seek(originalPosition);
+  return crc ^ 0xFFFFFFFFU;
+}
+
 void bleTransferTask(void *parameter) {
   String path = bleTransferPath;
   uint32_t offset = bleTransferOffset;
@@ -537,8 +672,20 @@ void bleTransferTask(void *parameter) {
     offset = 0;
   }
 
+  uint32_t fileCRC32 = calculateFileCRC32(file);
   file.seek(offset);
-  bleNotifyStatus(String("TRANSFER_STARTED:") + baseName(path) + ":" + String(fileSize) + ":" + String(offset));
+  bleTransferAckOffset = offset;
+  bleTransferAckReceived = false;
+  bleNotifyStatus(
+    String("TRANSFER_STARTED:")
+      + baseName(path)
+      + ":"
+      + String(fileSize)
+      + ":"
+      + String(offset)
+      + ":"
+      + String(fileCRC32)
+  );
 
   unsigned long readyDeadline = millis() + 5000;
   while (bleClientConnected && bleTransferInProgress && !bleTransferReceiverReady && millis() < readyDeadline) {
@@ -556,24 +703,67 @@ void bleTransferTask(void *parameter) {
 
   uint8_t packet[6 + BLE_TRANSFER_CHUNK_SIZE];
   bool sendFailed = false;
+  uint8_t windowRetryCount = 0;
   while (file.available() && bleClientConnected && bleTransferInProgress) {
-    uint32_t currentOffset = file.position();
-    size_t bytesRead = file.read(packet + 6, BLE_TRANSFER_CHUNK_SIZE);
-    if (bytesRead == 0) {
+    uint32_t windowStart = file.position();
+    uint32_t windowEnd = windowStart;
+    bleTransferAckReceived = false;
+
+    for (uint8_t chunkIndex = 0;
+         chunkIndex < BLE_TRANSFER_WINDOW_CHUNKS && file.available() && bleTransferInProgress;
+         chunkIndex++) {
+      uint32_t currentOffset = file.position();
+      size_t bytesRead = file.read(packet + 6, BLE_TRANSFER_CHUNK_SIZE);
+      if (bytesRead == 0) {
+        break;
+      }
+
+      writeUint32LE(packet, currentOffset);
+      writeUint16LE(packet + 4, (uint16_t)bytesRead);
+      if (!bleDataCharacteristic->notify(packet, bytesRead + 6)) {
+        sendFailed = true;
+        break;
+      }
+      windowEnd = file.position();
+
+      // ACK windows provide the backpressure; this small delay avoids filling
+      // the controller queue inside a single connection event.
+      vTaskDelay(3 / portTICK_PERIOD_MS);
+    }
+
+    if (sendFailed || windowEnd == windowStart) {
       break;
     }
 
-    writeUint32LE(packet, currentOffset);
-    writeUint16LE(packet + 4, (uint16_t)bytesRead);
-    // Notifications can be streamed continuously. iOS validates every packet
-    // offset and the final WAV size/header before accepting the local file.
-    if (!bleDataCharacteristic->notify(packet, bytesRead + 6)) {
+    unsigned long ackStartedAt = millis();
+    while (bleClientConnected
+           && bleTransferInProgress
+           && !bleTransferAckReceived
+           && millis() - ackStartedAt < BLE_TRANSFER_ACK_TIMEOUT_MS) {
+      vTaskDelay(5 / portTICK_PERIOD_MS);
+    }
+
+    if (!bleTransferAckReceived) {
       sendFailed = true;
       break;
     }
 
-    // Keep the transfer gentle for first hardware bring-up. We can tune this later.
-    vTaskDelay(15 / portTICK_PERIOD_MS);
+    uint32_t acknowledgedOffset = bleTransferAckOffset;
+    if (acknowledgedOffset < windowStart || acknowledgedOffset > windowEnd) {
+      sendFailed = true;
+      break;
+    }
+
+    if (acknowledgedOffset < windowEnd) {
+      windowRetryCount++;
+      if (windowRetryCount > BLE_TRANSFER_WINDOW_RETRY_LIMIT || !file.seek(acknowledgedOffset)) {
+        sendFailed = true;
+        break;
+      }
+      continue;
+    }
+
+    windowRetryCount = 0;
   }
 
   bool completed = !sendFailed && file.position() >= fileSize;
@@ -582,7 +772,12 @@ void bleTransferTask(void *parameter) {
   bleTransferTaskHandle = nullptr;
 
   if (sendFailed) {
-    bleNotifyStatus(String("TRANSFER_ERROR:BLE send failed:") + baseName(path));
+    bleNotifyStatus(
+      String("TRANSFER_ERROR:BLE transfer stalled:")
+        + baseName(path)
+        + ":"
+        + String(bleTransferAckOffset)
+    );
   } else if (completed) {
     bleNotifyStatus(String("TRANSFER_DONE:") + baseName(path) + ":" + String(fileSize));
   } else {
@@ -595,6 +790,11 @@ void bleTransferTask(void *parameter) {
 void startBleRecording() {
   if (!storageReady) {
     bleNotifyStatus("ERROR:SD card unavailable");
+    return;
+  }
+
+  if (bleTransferInProgress || bleTransferTaskHandle != nullptr) {
+    bleNotifyStatus("BUSY:Transfer running");
     return;
   }
 
@@ -625,6 +825,16 @@ void stopBleRecording() {
 }
 
 void startBleTransfer(String filename, uint32_t offset) {
+  if (!storageReady) {
+    bleNotifyStatus("TRANSFER_ERROR:SD card unavailable");
+    return;
+  }
+
+  if (isRecording || bleRecordTaskHandle != nullptr) {
+    bleNotifyStatus("BUSY:Recording in progress");
+    return;
+  }
+
   if (bleTransferTaskHandle != nullptr || bleTransferInProgress) {
     bleNotifyStatus("BUSY:Transfer already running");
     return;
@@ -643,7 +853,8 @@ void startBleTransfer(String filename, uint32_t offset) {
   bleTransferPath = path;
   bleTransferOffset = offset;
   bleTransferReceiverReady = false;
-  xTaskCreate(
+  bleTransferAckReceived = false;
+  BaseType_t taskCreated = xTaskCreate(
     bleTransferTask,
     "BLE Transfer Task",
     8192,
@@ -651,6 +862,11 @@ void startBleTransfer(String filename, uint32_t offset) {
     1,
     &bleTransferTaskHandle
   );
+  if (taskCreated != pdPASS) {
+    bleTransferTaskHandle = nullptr;
+    bleTransferInProgress = false;
+    bleNotifyStatus(String("TRANSFER_ERROR:Cannot start transfer:") + filename);
+  }
 }
 
 void stopBleTransfer() {
@@ -660,6 +876,7 @@ void stopBleTransfer() {
   }
 
   bleTransferInProgress = false;
+  bleTransferAckReceived = true;
 }
 
 void markPhoneSynced(String filename) {
@@ -689,6 +906,10 @@ void handleBleCommand(String command) {
   }
 
   if (command == "LIST") {
+    if (bleTransferInProgress || bleTransferTaskHandle != nullptr) {
+      bleNotifyStatus("BUSY:Transfer running");
+      return;
+    }
     publishRecordingManifest();
     return;
   }
@@ -712,6 +933,20 @@ void handleBleCommand(String command) {
     String filename = command.substring(String("TRANSFER_READY:").length());
     if (recordingPathFromName(filename) == bleTransferPath && bleTransferInProgress) {
       bleTransferReceiverReady = true;
+    }
+    return;
+  }
+
+  if (command.startsWith("TRANSFER_ACK:")) {
+    int firstColon = command.indexOf(':');
+    int secondColon = command.indexOf(':', firstColon + 1);
+    if (secondColon > 0) {
+      String filename = command.substring(firstColon + 1, secondColon);
+      uint32_t acknowledgedOffset = (uint32_t)command.substring(secondColon + 1).toInt();
+      if (recordingPathFromName(filename) == bleTransferPath && bleTransferInProgress) {
+        bleTransferAckOffset = acknowledgedOffset;
+        bleTransferAckReceived = true;
+      }
     }
     return;
   }
@@ -828,9 +1063,14 @@ void recordAudioFile(const char *audioFileName, bool (*shouldContinueRecording)(
   Serial.println("Recording started...");
   Serial.printf("Saving to: %s\n", audioFileName);
   Serial.println("Release button to stop recording.");
-  bleActiveRecordingPath = String(audioFileName);
+  String finalPath = String(audioFileName);
+  String temporaryPath = finalPath + ".recording";
+  bleActiveRecordingPath = finalPath;
+  if (SD.exists(temporaryPath)) {
+    SD.remove(temporaryPath);
+  }
 
-  File file = SD.open(audioFileName, FILE_WRITE);
+  File file = SD.open(temporaryPath, FILE_WRITE);
 
   if (!file) {
     Serial.println("Failed to open audio file for writing!");
@@ -855,6 +1095,7 @@ void recordAudioFile(const char *audioFileName, bool (*shouldContinueRecording)(
   }
 
   uint32_t totalBytesWritten = 0;
+  bool recordingSucceeded = true;
   isRecording = true;
 
   while (shouldContinueRecording()) {
@@ -862,6 +1103,7 @@ void recordAudioFile(const char *audioFileName, bool (*shouldContinueRecording)(
 
     if (bytesRead == 0) {
       Serial.println("I2S read failed!");
+      recordingSucceeded = false;
       break;
     }
 
@@ -871,6 +1113,7 @@ void recordAudioFile(const char *audioFileName, bool (*shouldContinueRecording)(
 
     if (bytesWritten != bytesRead) {
       Serial.println("SD write failed!");
+      recordingSucceeded = false;
       break;
     }
 
@@ -882,20 +1125,39 @@ void recordAudioFile(const char *audioFileName, bool (*shouldContinueRecording)(
   // Return LED to steady ON after recording.
   digitalWrite(RECORD_LED_PIN, HIGH);
 
-  // Now that we know the real audio size,
-  // go back to the beginning and rewrite the WAV header.
-  generate_wav_header(wav_header, totalBytesWritten, SAMPLE_RATE);
-  file.seek(0);
-  file.write(wav_header, WAV_HEADER_SIZE);
+  if (recordingSucceeded && totalBytesWritten > 0) {
+    // Now that we know the real audio size,
+    // go back to the beginning and rewrite the WAV header.
+    generate_wav_header(wav_header, totalBytesWritten, SAMPLE_RATE);
+    if (!file.seek(0) || file.write(wav_header, WAV_HEADER_SIZE) != WAV_HEADER_SIZE) {
+      recordingSucceeded = false;
+    }
+  } else {
+    recordingSucceeded = false;
+  }
 
   free(rec_buffer);
   file.close();
+
+  if (recordingSucceeded) {
+    if (SD.exists(finalPath)) {
+      SD.remove(finalPath);
+    }
+    recordingSucceeded = SD.rename(temporaryPath, finalPath);
+  }
+  if (!recordingSucceeded) {
+    SD.remove(temporaryPath);
+  }
   bleActiveRecordingPath = "";
 
-  Serial.println("Recording stopped.");
-  Serial.printf("Audio data written: %lu bytes\n", totalBytesWritten);
-  Serial.println("WAV header updated.");
-  Serial.println("File closed safely.");
+  if (recordingSucceeded) {
+    Serial.println("Recording stopped.");
+    Serial.printf("Audio data written: %lu bytes\n", totalBytesWritten);
+    Serial.println("WAV header updated.");
+    Serial.println("File closed safely.");
+  } else {
+    Serial.println("Recording failed; incomplete temporary file removed.");
+  }
 }
 
 void recordWhileButtonHeld(const char *audioFileName) {
@@ -978,6 +1240,7 @@ void setup() {
     return;
   }
 
+  cleanupTemporaryRecordings();
   storageReady = true;
   setupBle();
 
@@ -1010,13 +1273,25 @@ void loop() {
     command.trim();
     if (command == "CLEAR_RECORDINGS") {
       clearAudioDirectory();
+    } else if (command == "RECORD_START") {
+      startBleRecording();
+    } else if (command == "RECORD_STOP") {
+      stopBleRecording();
+    } else if (command == "LIST") {
+      publishRecordingManifest();
     }
   }
 
-  if (storageReady && !isRecording && buttonPressed()) {
+  static bool hardwareButtonArmed = false;
+  if (!buttonPressed()) {
+    hardwareButtonArmed = true;
+  }
+
+  if (storageReady && hardwareButtonArmed && !isRecording && buttonPressed()) {
     delay(30); // debounce
 
     if (buttonPressed()) {
+      hardwareButtonArmed = false;
       String audioFileName = getNextAudioFileName();
 
       recordWhileButtonHeld(audioFileName.c_str());
