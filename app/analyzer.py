@@ -17,6 +17,9 @@ import soundfile as sf
 from faster_whisper import WhisperModel
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
+from app.insights import compute_insights
+from app.llm_interpreter import apply_contextualization, interpret_conversation
+
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
 RUN_DIR = Path(os.getenv("RUN_DIR", "analysis_runs"))
@@ -141,8 +144,18 @@ def analyze_audio(input_path: Path, original_name: str) -> dict[str, Any]:
         "model": os.getenv("WHISPER_MODEL", "base.en"),
         "run_id": run_id,
     }
+    metrics["insights"] = compute_insights(metrics)
+    if auto_interpret_enabled():
+        interpretation = interpret_conversation(metrics)
+        metrics["interpretation"] = interpretation
+        metrics = apply_contextualization(metrics, interpretation)
 
     return metrics
+
+
+def auto_interpret_enabled() -> bool:
+    value = os.getenv("AUTO_INTERPRET_ANALYSIS", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def diarization_mode() -> str:

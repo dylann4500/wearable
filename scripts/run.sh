@@ -3,6 +3,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
 pick_python() {
   for candidate in \
     python3.12 \
@@ -37,6 +44,10 @@ fi
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+if [ -n "${HF_TOKEN:-}" ] || [ -n "${HUGGINGFACE_TOKEN:-}" ] || [ "${INSTALL_DIARIZATION:-0}" = "1" ]; then
+  python -m pip install -r requirements-diarization.txt
+  python -m pip install 'setuptools<81'
+fi
 
 if ! command -v ffmpeg >/dev/null 2>&1; then
   echo "Warning: ffmpeg is required for uploads. Install it with: brew install ffmpeg"
@@ -56,5 +67,7 @@ uvicorn app.main:app \
   --host 127.0.0.1 \
   --port "${PORT:-8000}" \
   --reload \
+  --reload-exclude ".venv/*" \
+  --reload-exclude "frontend/node_modules/*" \
   --reload-dir app \
   --reload-dir frontend/src

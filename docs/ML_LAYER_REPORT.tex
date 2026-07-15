@@ -1,0 +1,753 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{longtable}
+\usepackage{array}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue
+}
+
+\title{Conversation Intelligence ML Layer: Current Architecture, Algorithms, Validation, and Future Direction}
+\author{Wearable Conversation Analytics}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Executive Summary}
+
+The current machine learning layer is a hybrid conversation-intelligence system. It combines deterministic feature engineering, explainable middle-layer behavioral scoring, high-level emotional-intelligence scoring, and an LLM interpretation layer. The system is not yet a fully supervised production ML model trained on a large curated dataset. Instead, it is an explainable baseline designed to:
+
+\begin{enumerate}[leftmargin=*]
+  \item extract low-level acoustic, timing, transcript, and language features from an audio conversation;
+  \item convert those raw features into interpretable middle-layer behavioral variables;
+  \item combine middle-layer variables into top-level coaching dimensions such as warmth, curiosity, emotional regulation, clarity, and respectful disagreeability;
+  \item classify conversation context with an LLM and produce a plain-language discussion brief;
+  \item adjust which high-level scores matter most according to context;
+  \item persist raw feature snapshots, scores, LLM interpretation, and human labels for future supervised training.
+\end{enumerate}
+
+The design philosophy is deliberately conservative: the app should not pretend to infer stable personality traits from one conversation. Current scores are best understood as coaching hypotheses about observable conversation behavior. The system emphasizes inspectability, calibration, and future label collection over opaque model complexity.
+
+\section{End-to-End Pipeline}
+
+The current pipeline is:
+
+\[
+\text{audio} \rightarrow \text{transcription/diarization} \rightarrow \text{raw metrics} \rightarrow
+\text{middle-layer scores} \rightarrow \text{top-level scores} \rightarrow
+\text{LLM context interpretation} \rightarrow \text{contextualized priorities}.
+\]
+
+In the application result JSON, the main outputs are:
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{transcript}: speaker-attributed turns with timing and text.
+  \item \texttt{summary}: global conversation counts such as total words, duration, WPM, speaker count, silence percentage, and turn count.
+  \item \texttt{speakers}: per-speaker talk time, word count, WPM, sentiment, pitch, and volume.
+  \item \texttt{turn\_taking}: response latency, average turn duration, long turns, fast responses, slow responses, and monologues.
+  \item \texttt{language}: fillers, questions, follow-up estimate, backchannels, validation phrases, advice phrases, lexical diversity, and sentence length.
+  \item \texttt{sentiment}: VADER-style sentiment summary and trajectory.
+  \item \texttt{audio\_quality}: volume, dynamic range, pitch range, pitch variability, and confidence.
+  \item \texttt{insights}: deterministic raw feature snapshot, middle-layer scores, top-level scores, and context-aware priorities.
+  \item \texttt{interpretation}: LLM or local interpretation, including context, discussion brief, narrative summary, action plan, and label suggestions.
+\end{itemize}
+
+\section{Raw Feature Layer}
+
+The raw feature layer is the lowest level of the system. It contains measurements that are either directly extracted from audio/transcript processing or are simple derived statistics. These are intentionally preserved because future models need stable, versioned feature inputs.
+
+\subsection{Current Raw Feature Families}
+
+\begin{longtable}{p{0.24\linewidth}p{0.68\linewidth}}
+\toprule
+\textbf{Feature Family} & \textbf{Examples} \\
+\midrule
+Timing and turns & Duration, total turns, average turn length, longest turn, response latency, very short responses, slow responses, fast responses. \\
+Participation & Speaker count, talk-time percentage, word count, word share, focus speaker assumption. \\
+Speech rate and fluency & Conversation WPM, focus-speaker WPM, filler rate, average sentence length, lexical diversity. \\
+Listening signals & Question count, questions per minute, follow-up question estimate, backchannels, validation phrases. \\
+Friction and interruption proxies & Estimated interjections, fast responses under 300ms, long monologues, long pauses. \\
+Sentiment & Average sentiment, minimum sentiment, ending sentiment, largest sentiment shift. \\
+Prosody and quality & Volume dynamic range, pitch variability, audio quality confidence. \\
+Diarization & Whether diarization is enabled, estimated speaker count, diarization backend/status. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Important Caveats}
+
+Several raw features are approximate:
+
+\begin{itemize}[leftmargin=*]
+  \item Speaker identity is not yet true user identity. The app currently chooses a focus speaker from available speaker labels.
+  \item Interjections are heuristic. True interruption detection needs frame-level overlap and stronger diarization.
+  \item Follow-up questions are currently estimated from surface forms, not deep semantic adjacency.
+  \item VADER-style sentiment is useful for coarse valence but insufficient for sarcasm, politeness, defensiveness, empathy, or complex emotional meaning.
+  \item Validation and advice phrases rely partly on phrase lists and will miss paraphrases.
+\end{itemize}
+
+\section{Deterministic Insight Layer}
+
+The deterministic insight layer lives in \texttt{app/insights.py}. Its purpose is to turn raw metrics into explainable behavior scores immediately, before the system has a large labeled dataset.
+
+\subsection{Why Deterministic Scoring Exists}
+
+This layer exists because the product needs an interpretable baseline. It provides:
+
+\begin{itemize}[leftmargin=*]
+  \item stable behavior while real labels are still being collected;
+  \item human-readable drivers for each score;
+  \item safe fallback behavior when LLM or future model calls fail;
+  \item training features and weak labels for the future supervised layer;
+  \item a reference point against which learned models can be compared.
+\end{itemize}
+
+The deterministic scores should not be treated as ground truth. They are hypotheses: ``given these observable signals, this conversation appears more or less warm, curious, balanced, regulated, or clear.''
+
+\subsection{Scoring Transformations}
+
+The scoring functions transform raw numeric features into 0--100 sub-scores. Higher is always better for the user-facing construct.
+
+For variables where lower is better, such as filler rate or excessive monologues, the general form is:
+
+\[
+S_{\text{low-good}}(x; g, b)
+= 100 \cdot \left(1 - \mathrm{clip}\left(\frac{x-g}{b-g}, 0, 1\right)\right),
+\]
+
+where \(g\) is a good threshold and \(b\) is a bad threshold.
+
+For variables where higher is better, such as validation phrases or sufficient transcript length, the general form is:
+
+\[
+S_{\text{high-good}}(x; p, g)
+= 100 \cdot \mathrm{clip}\left(\frac{x-p}{g-p}, 0, 1\right),
+\]
+
+where \(p\) is a poor threshold and \(g\) is a good threshold.
+
+For variables with an ideal range, such as response latency or speaking rate, the score rewards values inside a healthy band and penalizes values too low or too high:
+
+\[
+S_{\text{range}}(x; l, i_l, i_h, h)
+=
+\begin{cases}
+100 \cdot \mathrm{clip}\left(\frac{x-l}{i_l-l},0,1\right), & x < i_l,\\
+100, & i_l \leq x \leq i_h,\\
+100 \cdot \left(1-\mathrm{clip}\left(\frac{x-i_h}{h-i_h},0,1\right)\right), & x > i_h.
+\end{cases}
+\]
+
+Composite scores are weighted means:
+
+\[
+S = \frac{\sum_i w_i S_i}{\sum_i w_i}.
+\]
+
+This keeps the model explainable: every score can be decomposed into observable inputs.
+
+\section{Middle-Layer Behavioral Variables}
+
+The middle layer is the bridge between low-level metrics and high-level coaching dimensions. These variables describe observable conversation behaviors, not broad personality traits.
+
+\begin{longtable}{p{0.26\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+\textbf{Middle Variable} & \textbf{Meaning} & \textbf{Primary Inputs} \\
+\midrule
+\texttt{conversational\_balance} & Whether talk time and word share are reasonably balanced for the speaker count. & Talk-time gap, word-share gap, monologues. \\
+\texttt{floor\_dominance\_control} & Whether the focus speaker avoids holding the floor too long. & Longest turn, monologues, excess talk share. \\
+\texttt{turn\_exchange\_smoothness} & Whether transitions are neither too abrupt nor too delayed. & Response latency, fast responses, interjections, slow responses. \\
+\texttt{curiosity} & Whether the speaker asks questions and follows up. & Questions per minute, follow-up/question ratio. \\
+\texttt{active\_listening} & Whether the speaker signals attention and understanding. & Backchannels, validation phrases, follow-up ratio. \\
+\texttt{validation} & Explicit acknowledgement of the other person's experience or viewpoint. & Validation phrase count. \\
+\texttt{premature\_advice\_control} & Whether advice is not given before sufficient validation. & Advice phrases minus validation phrases, validation/advice ratio. \\
+\texttt{emotional\_stability} & Stability and positivity of affective trajectory. & Average sentiment, largest sentiment shift, ending sentiment. \\
+\texttt{reactivity\_control} & Avoidance of impulsive, interruptive, or negative responses. & Fast responses, interjections, negative sentiment trough. \\
+\texttt{clarity} & Fluency and understandable pacing. & Fillers, WPM, sentence length. \\
+\texttt{expressiveness} & Prosodic variation without assuming dysregulation. & Pitch variability, volume dynamic range. \\
+\bottomrule
+\end{longtable}
+
+\section{Top-Level Coaching Variables}
+
+The current top-level variables are:
+
+\begin{enumerate}[leftmargin=*]
+  \item \texttt{warmth}
+  \item \texttt{curiosity}
+  \item \texttt{conversational\_balance}
+  \item \texttt{respectful\_disagreeability}
+  \item \texttt{emotional\_regulation}
+  \item \texttt{clarity}
+  \item \texttt{conversational\_generosity}
+\end{enumerate}
+
+\subsection{Top-Level Formulas}
+
+Each top-level variable is a weighted combination of middle-layer variables:
+
+\[
+\text{Warmth} =
+0.32A + 0.28V + 0.24E + 0.16P,
+\]
+
+where \(A\) is active listening, \(V\) is validation, \(E\) is emotional stability, and \(P\) is a sentiment-derived positivity score.
+
+\[
+\text{Curiosity} =
+0.58C + 0.27A + 0.15T,
+\]
+
+where \(C\) is middle-layer curiosity, \(A\) is active listening, and \(T\) is turn-exchange smoothness.
+
+\[
+\text{Conversational Balance} =
+0.45B + 0.35F + 0.20T,
+\]
+
+where \(B\) is balance, \(F\) is floor-dominance control, and \(T\) is turn-exchange smoothness.
+
+\[
+\text{Respectful Disagreeability} =
+0.32R + 0.26D + 0.22V + 0.20E,
+\]
+
+where \(R\) is reactivity control, \(D\) is premature-advice control, \(V\) is validation, and \(E\) is emotional stability.
+
+\[
+\text{Emotional Regulation} =
+0.45E + 0.35R + 0.20T.
+\]
+
+\[
+\text{Clarity} =
+0.75K + 0.25T,
+\]
+
+where \(K\) is middle-layer clarity.
+
+\[
+\text{Conversational Generosity} =
+0.34B + 0.36A + 0.30C.
+\]
+
+These formulas are intentionally simple. The goal is not to claim that warmth is mathematically reducible to four signals; the goal is to create an inspectable first approximation that can be revised with labels.
+
+\section{Confidence Scoring}
+
+Each insight also receives a confidence estimate. Confidence depends on:
+
+\begin{itemize}[leftmargin=*]
+  \item recording duration;
+  \item number of turns;
+  \item whether diarization was enabled;
+  \item audio-quality confidence;
+  \item total word count.
+\end{itemize}
+
+The confidence score is a weighted mean clipped between 0.15 and 0.95. The intuition is straightforward: longer, clearer, multi-turn conversations with better diarization provide more evidence than short or noisy recordings.
+
+\section{Fixed Coaching Context Categories}
+
+The LLM classifies a conversation into one of the current fixed context categories:
+
+\begin{enumerate}[leftmargin=*]
+  \item \texttt{interview}
+  \item \texttt{date}
+  \item \texttt{service\_interaction}
+  \item \texttt{sales\_or\_negotiation}
+  \item \texttt{work\_meeting}
+  \item \texttt{supportive\_personal\_conversation}
+  \item \texttt{conflict\_or\_disagreement}
+  \item \texttt{casual\_social}
+  \item \texttt{unknown}
+\end{enumerate}
+
+These categories are not meant to describe every possible conversation topic. They are coaching contexts. Their purpose is to decide which emotional-intelligence variables should matter more. For example, a directions conversation may be assigned \texttt{service\_interaction} because clarity, patience, and efficient responsiveness matter more than deep emotional disclosure.
+
+\subsection{Context Category vs. Discussion Brief}
+
+The app now separates two ideas:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Context type}: a fixed coaching bucket used for weighting.
+  \item \textbf{Discussion brief}: a plain-language summary of what the audio actually discusses.
+\end{itemize}
+
+For example:
+
+\begin{quote}
+\texttt{context.type = service\_interaction}
+
+\texttt{context.brief = Speaker 1 is giving step-by-step directions to Speaker 2 about a route around a caravan park, old mill, abandoned cottage, and lake.}
+\end{quote}
+
+Therefore \texttt{unknown} means only that the system could not confidently choose a fixed coaching category. It should not mean that the system cannot summarize the conversation.
+
+\section{LLM Interpretation Layer}
+
+The LLM interpretation layer lives in \texttt{app/llm\_interpreter.py}. It currently supports:
+
+\begin{itemize}[leftmargin=*]
+  \item local deterministic fallback interpretation;
+  \item Groq Chat Completions API;
+  \item OpenAI Responses API path, if configured.
+\end{itemize}
+
+The active local configuration uses Groq with an OpenAI-compatible API endpoint:
+
+\[
+\texttt{POST https://api.groq.com/openai/v1/chat/completions}.
+\]
+
+\subsection{Input to the LLM}
+
+The LLM does not receive the entire raw result blindly. The backend compacts the result into:
+
+\begin{itemize}[leftmargin=*]
+  \item summary metrics;
+  \item speaker metrics;
+  \item turn-taking metrics;
+  \item language metrics;
+  \item sentiment summary;
+  \item compact interjection events;
+  \item audio-quality metrics;
+  \item deterministic insight scores and middle-layer scores;
+  \item a transcript excerpt with a configurable turn limit and character limit.
+\end{itemize}
+
+This reduces token cost and helps the model focus on coaching-relevant evidence.
+
+\subsection{Required LLM Output}
+
+The expected interpretation shape includes:
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{context.type}: one of the fixed coaching categories;
+  \item \texttt{context.confidence}: confidence in context classification;
+  \item \texttt{context.brief}: concrete plain-language topic summary;
+  \item \texttt{discussion\_brief}: same topic summary, available at top level;
+  \item \texttt{context.signals}: evidence used for classification;
+  \item \texttt{context.why\_it\_matters}: why this context changes coaching priorities;
+  \item \texttt{context\_weighted\_priorities}: LLM-suggested score priorities;
+  \item \texttt{summary}: narrative analysis;
+  \item \texttt{strengths}: strongest variables and why;
+  \item \texttt{growth\_areas}: weaker variables and why;
+  \item \texttt{action\_plan}: concrete next actions;
+  \item \texttt{label\_suggestions}: proposed labels for future training;
+  \item \texttt{limitations}: caveats and uncertainty.
+\end{itemize}
+
+\subsection{Normalization and Fallback}
+
+LLMs sometimes return loose labels such as ``instructional navigation conversation'' instead of the fixed category \texttt{service\_interaction}. The backend normalizes such labels into the fixed taxonomy. It also ensures a brief exists even when the LLM leaves narrative fields blank.
+
+The normalization process:
+
+\begin{enumerate}[leftmargin=*]
+  \item parse the JSON object returned by the provider;
+  \item coerce \texttt{context} into a dictionary if necessary;
+  \item map loose context phrases to canonical categories;
+  \item insert a raw-context signal if the LLM used a non-canonical phrase;
+  \item fill missing \texttt{context.brief} from \texttt{discussion\_brief}, \texttt{summary}, transcript heuristics, or first turns;
+  \item if context is still \texttt{unknown}, attempt local heuristic inference from transcript keywords;
+  \item if the provider fails, use local deterministic fallback when enabled.
+\end{enumerate}
+
+\section{Contextualized Scoring}
+
+The deterministic top-level scores answer:
+
+\begin{quote}
+How strong does this behavior appear in the conversation?
+\end{quote}
+
+The contextualized layer answers a different question:
+
+\begin{quote}
+Given this conversation context, how important is this variable right now?
+\end{quote}
+
+For each top-level variable, the backend creates:
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{score}: original deterministic 0--100 score;
+  \item \texttt{context\_weight}: context-specific importance weight;
+  \item \texttt{priority}: coaching priority;
+  \item \texttt{importance}: qualitative label such as low, moderate, high, or central;
+  \item \texttt{drivers}: evidence from the deterministic layer;
+  \item \texttt{practice}: suggested coaching action.
+\end{itemize}
+
+The default priority formula is:
+
+\[
+\text{priority}_j = (100 - \text{score}_j) \cdot \text{context\_weight}_j.
+\]
+
+This means a low score only becomes a major coaching priority if that variable matters in the current context.
+
+\subsection{Context Weights}
+
+Base weights are:
+
+\begin{longtable}{p{0.45\linewidth}p{0.25\linewidth}}
+\toprule
+\textbf{Variable} & \textbf{Base Weight} \\
+\midrule
+Warmth & 0.75 \\
+Curiosity & 0.70 \\
+Conversational balance & 0.75 \\
+Respectful disagreeability & 0.65 \\
+Emotional regulation & 0.75 \\
+Clarity & 0.70 \\
+Conversational generosity & 0.70 \\
+\bottomrule
+\end{longtable}
+
+Context-specific overrides include:
+
+\begin{longtable}{p{0.28\linewidth}p{0.62\linewidth}}
+\toprule
+\textbf{Context} & \textbf{Variables Given Extra Weight} \\
+\midrule
+Interview & Clarity, curiosity, warmth. \\
+Date & Warmth, curiosity, conversational generosity. \\
+Service interaction & Clarity, emotional regulation, warmth. \\
+Sales or negotiation & Clarity, respectful disagreeability, conversational balance. \\
+Work meeting & Clarity, conversational balance, respectful disagreeability. \\
+Supportive personal conversation & Warmth, curiosity, conversational generosity. \\
+Conflict or disagreement & Respectful disagreeability, emotional regulation, warmth. \\
+\bottomrule
+\end{longtable}
+
+\section{Human Labeling and Dataset Export}
+
+The app includes routes and UI for saving curated labels. Labels can be attached at multiple scopes:
+
+\begin{itemize}[leftmargin=*]
+  \item conversation;
+  \item segment;
+  \item turn pair;
+  \item turn.
+\end{itemize}
+
+Each label includes target, value, source, confidence, and rationale. The export routes produce JSON and JSONL training rows that combine:
+
+\begin{itemize}[leftmargin=*]
+  \item recording metadata;
+  \item raw feature snapshot;
+  \item deterministic scores;
+  \item interpretation context;
+  \item contextualized priorities;
+  \item curated labels.
+\end{itemize}
+
+This is essential because the app cannot become genuinely accurate without labeled data. The deterministic layer gives a starting point, but human-curated labels are the path to calibrated supervised learning.
+
+\section{Model Survey and Algorithm Selection}
+
+A model survey was implemented in \texttt{scripts/survey\_insight\_models.py}. Because no real labeled corpus was available, the experiment used 1,200 synthetic conversations generated from raw metric distributions. The train/test split was 75/25.
+
+\subsection{Approaches Tested}
+
+\begin{itemize}[leftmargin=*]
+  \item deterministic scoring rules;
+  \item mean baseline;
+  \item Ridge regression;
+  \item ElasticNet regression;
+  \item partial least squares;
+  \item k-nearest neighbors;
+  \item random forest;
+  \item Extra Trees;
+  \item histogram gradient boosting;
+  \item RBF support vector regression;
+  \item small multilayer perceptron;
+  \item k-means clustering for unsupervised profile discovery.
+\end{itemize}
+
+\subsection{Synthetic Survey Results}
+
+\begin{longtable}{p{0.42\linewidth}rrrr}
+\toprule
+\textbf{Approach} & \textbf{MAE} & \textbf{RMSE} & \textbf{R2} & \textbf{Corr} \\
+\midrule
+ElasticNet regression & 8.14 & 10.10 & 0.576 & 0.752 \\
+Ridge regression & 8.15 & 10.11 & 0.575 & 0.751 \\
+Histogram gradient boosting & 8.23 & 10.22 & 0.566 & 0.741 \\
+RBF support vector regression & 8.43 & 10.50 & 0.545 & 0.728 \\
+Partial least squares & 8.58 & 10.61 & 0.526 & 0.674 \\
+Extra Trees & 9.50 & 11.71 & 0.451 & 0.721 \\
+k-nearest neighbors & 9.63 & 11.89 & 0.431 & 0.686 \\
+Small MLP regressor & 9.66 & 11.96 & 0.420 & 0.654 \\
+Random forest & 9.76 & 12.09 & 0.419 & 0.656 \\
+Mean training baseline & 13.15 & 16.09 & -0.004 & 0.000 \\
+Deterministic scoring rules & 16.00 & 19.36 & -0.787 & 0.530 \\
+\bottomrule
+\end{longtable}
+
+\subsection{Interpretation of Results}
+
+The synthetic experiment should not be interpreted as production accuracy. It only checks whether the proposed modeling pipeline can learn plausible relationships from raw metrics. The main conclusions were:
+
+\begin{itemize}[leftmargin=*]
+  \item ElasticNet and Ridge performed best overall on the simulated targets.
+  \item Linear regularized models are strong baselines because many raw metrics should have roughly monotonic relationships with target scores.
+  \item Histogram gradient boosting is competitive and better suited for nonlinear thresholds and feature interactions.
+  \item Tree ensembles are useful for feature importance and interaction discovery, but may overfit small datasets.
+  \item The small MLP did not justify itself as a near-term production choice because it is less interpretable and label-hungry.
+  \item Deterministic scoring is not statistically optimal, but it remains valuable because it is explainable, stable, and available before labels exist.
+\end{itemize}
+
+\section{Why Not Start With a Large Neural Network?}
+
+A large neural model is not currently the right default for the core scoring layer because:
+
+\begin{enumerate}[leftmargin=*]
+  \item there is no large validated labeled dataset yet;
+  \item emotional-intelligence labels are subjective and context-dependent;
+  \item debugging an opaque model would be difficult;
+  \item user trust requires interpretable drivers;
+  \item small data plus high model capacity creates overfitting risk;
+  \item the app needs stable behavior now in order to collect the data that would justify a neural model later.
+\end{enumerate}
+
+The recommended near-term approach is therefore hybrid:
+
+\[
+\text{deterministic baseline} + \text{LLM interpretation} + \text{human labels} + \text{regularized supervised models}.
+\]
+
+\section{Current Limitations}
+
+\subsection{Measurement Limitations}
+
+\begin{itemize}[leftmargin=*]
+  \item Diarization may confuse speakers, especially in noisy or overlapping audio.
+  \item True interruption and overlap are not yet robustly measured.
+  \item Voice quality and prosody features are relatively simple.
+  \item Sentiment is too shallow for complex social meaning.
+  \item Transcript quality directly constrains semantic analysis.
+\end{itemize}
+
+\subsection{Modeling Limitations}
+
+\begin{itemize}[leftmargin=*]
+  \item Current scores are heuristic and not calibrated against human ratings.
+  \item Context weights are hand-defined and need validation.
+  \item The focus speaker may not always be the actual user.
+  \item LLM output can vary; backend normalization reduces this but does not remove all uncertainty.
+  \item Labels are not yet numerous enough to train real supervised production models.
+\end{itemize}
+
+\subsection{Product Interpretation Limitations}
+
+\begin{itemize}[leftmargin=*]
+  \item One conversation is not enough to infer a stable trait.
+  \item The same behavior can mean different things across cultures, relationships, goals, and settings.
+  \item Some contexts require different norms: a job interview, a date, a support conversation, and a negotiation should not be scored identically.
+  \item Coaching output should remain concrete and evidence-based, not diagnostic.
+\end{itemize}
+
+\section{Validation Plan}
+
+\subsection{Stage 1: Feature Validation}
+
+Before trusting higher-level scores, validate the raw layer:
+
+\begin{itemize}[leftmargin=*]
+  \item compare transcripts against audio;
+  \item check speaker diarization manually;
+  \item verify turn boundaries;
+  \item spot-check response latency and interjection estimates;
+  \item measure audio quality and transcript confidence.
+\end{itemize}
+
+\subsection{Stage 2: Context Validation}
+
+Create a hand-labeled context dataset with categories such as interview, date, service interaction, work meeting, supportive personal conversation, conflict/disagreement, and casual social.
+
+Evaluate:
+
+\begin{itemize}[leftmargin=*]
+  \item context classification accuracy;
+  \item confusion matrix;
+  \item confidence calibration;
+  \item ambiguous cases;
+  \item quality of discussion brief.
+\end{itemize}
+
+\subsection{Stage 3: Human Label Validation}
+
+For each target variable:
+
+\begin{itemize}[leftmargin=*]
+  \item use at least two independent raters on a subset;
+  \item define scoring rubrics for each variable;
+  \item measure inter-rater agreement;
+  \item keep disagreement visible rather than flattening prematurely;
+  \item compare LLM suggestions against human labels.
+\end{itemize}
+
+\subsection{Stage 4: Model Validation}
+
+Train baseline models on exported JSONL rows:
+
+\begin{itemize}[leftmargin=*]
+  \item Ridge;
+  \item ElasticNet;
+  \item histogram gradient boosting;
+  \item Extra Trees;
+  \item calibrated logistic/ordinal models for binned labels.
+\end{itemize}
+
+Evaluate using:
+
+\begin{itemize}[leftmargin=*]
+  \item MAE and RMSE for continuous labels;
+  \item correlation and \(R^2\);
+  \item calibration curves;
+  \item per-context performance;
+  \item ablation studies;
+  \item comparison against deterministic baseline.
+\end{itemize}
+
+\subsection{Stage 5: Product Validation}
+
+The final product question is not merely ``is the score accurate?'' It is:
+
+\begin{quote}
+Does the user understand the feedback, trust it, and know what to practice next?
+\end{quote}
+
+Measure:
+
+\begin{itemize}[leftmargin=*]
+  \item perceived accuracy;
+  \item usefulness;
+  \item clarity of explanation;
+  \item whether suggested practices are actionable;
+  \item longitudinal improvement across sessions.
+\end{itemize}
+
+\section{Future Direction}
+
+\subsection{Improve Raw Signal Collection}
+
+High-priority additions:
+
+\begin{itemize}[leftmargin=*]
+  \item frame-level voice activity detection;
+  \item true overlap duration by speaker;
+  \item speaking-rate changes over time;
+  \item per-turn pitch and energy contours;
+  \item laughter, sighs, and stress markers where feasible;
+  \item stronger diarization confidence and speaker-consistency metrics.
+\end{itemize}
+
+\subsection{Add Semantic Conversation Acts}
+
+Future semantic labels should include:
+
+\begin{itemize}[leftmargin=*]
+  \item validation;
+  \item question;
+  \item follow-up question;
+  \item advice;
+  \item disagreement;
+  \item repair attempt;
+  \item apology;
+  \item boundary;
+  \item topic shift;
+  \item emotional disclosure;
+  \item reassurance;
+  \item clarification request.
+\end{itemize}
+
+These can initially be generated with LLM-assisted weak supervision and then refined by human labels.
+
+\subsection{Train Calibrated Supervised Models}
+
+Once enough labels exist, train:
+
+\begin{itemize}[leftmargin=*]
+  \item Ridge and ElasticNet as stable baselines;
+  \item gradient boosting for nonlinear interactions;
+  \item Extra Trees for exploratory feature importance;
+  \item calibrated ordinal models if labels are rubric bins;
+  \item multi-task models that predict several related variables together.
+\end{itemize}
+
+The first real production model should probably not replace the deterministic layer outright. It should calibrate or adjust deterministic scores when it demonstrably improves validation metrics.
+
+\subsection{Use Embeddings for Semantic Features}
+
+Raw counts cannot capture whether a question genuinely follows from the other person's previous turn. Turn embeddings can support:
+
+\begin{itemize}[leftmargin=*]
+  \item topic continuity;
+  \item semantic follow-up detection;
+  \item whether the user paraphrased the partner's point;
+  \item disagreement detection beyond keyword matching;
+  \item emotional attunement and mismatch.
+\end{itemize}
+
+\subsection{Move Toward a Hybrid Neural Model}
+
+After enough labeled data exists, a hybrid architecture becomes appropriate:
+
+\begin{itemize}[leftmargin=*]
+  \item text branch: transcript embeddings and dialogue-act labels;
+  \item audio branch: prosody, overlap, pitch, energy, speech rate;
+  \item structure branch: turn-taking graph and temporal patterns;
+  \item fusion layer: combines branches;
+  \item multi-task heads: predict middle-layer and top-level variables.
+\end{itemize}
+
+The neural model should improve semantic sensitivity while preserving explainability through evidence snippets, drivers, and calibrated uncertainty.
+
+\subsection{Personalization}
+
+Eventually, the system should account for:
+
+\begin{itemize}[leftmargin=*]
+  \item user goals;
+  \item recurring conversation contexts;
+  \item baseline speaking style;
+  \item cultural and relationship norms;
+  \item longitudinal trends;
+  \item user feedback on accuracy.
+\end{itemize}
+
+Personalization should be opt-in and transparent. The app should distinguish ``you usually do X'' from ``in this recording, the system observed X.''
+
+\section{Recommended Near-Term Roadmap}
+
+\begin{enumerate}[leftmargin=*]
+  \item Finalize rubrics for each top-level variable and middle-layer behavior.
+  \item Collect a small curated dataset of 50--100 real conversations or conversation segments.
+  \item Label each example for context, discussion brief quality, warmth, curiosity, balance, clarity, regulation, and disagreement style.
+  \item Measure agreement between human raters.
+  \item Compare deterministic scores, LLM suggestions, and human labels.
+  \item Train Ridge, ElasticNet, and histogram gradient boosting baselines.
+  \item Add model comparison reports to the app or CLI.
+  \item Keep deterministic scoring as fallback until learned models beat it reliably.
+  \item Add transcript evidence snippets for every major coaching claim.
+  \item Iterate the UI so users can see raw metrics, middle variables, top scores, context, priority weighting, and evidence.
+\end{enumerate}
+
+\section{Conclusion}
+
+The current ML layer is best understood as an explainable hybrid baseline. It already performs the full conceptual flow from raw speech metrics to middle-layer behaviors, top-level coaching variables, LLM context interpretation, and context-weighted priorities. Its most important current strength is transparency: every score has a visible chain of reasoning. Its largest current limitation is the absence of real curated labels.
+
+The next major milestone is not a larger model. It is a better dataset: labeled conversations, validated rubrics, context labels, human agreement measurements, and systematic comparison between deterministic scores, LLM interpretation, and supervised models. Once that foundation exists, the system can move from heuristic coaching hypotheses toward calibrated, evidence-backed conversation intelligence.
+
+\end{document}

@@ -3,6 +3,17 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $RepoRoot
 
+if (Test-Path ".env") {
+  Get-Content ".env" | ForEach-Object {
+    $line = $_.Trim()
+    if ($line -eq "" -or $line.StartsWith("#")) { return }
+    $parts = $line.Split("=", 2)
+    if ($parts.Length -eq 2) {
+      [Environment]::SetEnvironmentVariable($parts[0], $parts[1], "Process")
+    }
+  }
+}
+
 function Find-Python {
   $candidates = @(
     @{ Command = "py"; Args = @("-3.12") },
@@ -54,6 +65,13 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $venvPython -m pip install -r requirements.txt
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+if ($env:HF_TOKEN -or $env:HUGGINGFACE_TOKEN -or $env:INSTALL_DIARIZATION -eq "1") {
+  & $venvPython -m pip install -r requirements-diarization.txt
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  & $venvPython -m pip install "setuptools<81"
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
 if ($null -eq (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
   Write-Warning "ffmpeg is required for uploads. Install it with: winget install Gyan.FFmpeg"
 }
@@ -72,4 +90,4 @@ if ($null -ne (Get-Command npm -ErrorAction SilentlyContinue)) {
 $env:PYTHONPATH = "$RepoRoot"
 $port = if ($env:PORT) { $env:PORT } else { "8000" }
 
-& $venvPython -m uvicorn app.main:app --host 127.0.0.1 --port $port --reload --reload-dir app --reload-dir frontend/src
+& $venvPython -m uvicorn app.main:app --host 127.0.0.1 --port $port --reload --reload-exclude ".venv/*" --reload-exclude "frontend/node_modules/*" --reload-dir app --reload-dir frontend/src
