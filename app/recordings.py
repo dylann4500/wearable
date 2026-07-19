@@ -36,6 +36,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS recordings (
                 id TEXT PRIMARY KEY,
+                upload_id TEXT,
                 device_id TEXT,
                 original_filename TEXT NOT NULL,
                 storage_path TEXT NOT NULL,
@@ -48,6 +49,16 @@ def init_db() -> None:
                 completed_at TEXT
             )
             """
+        )
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(recordings)").fetchall()
+        }
+        if "upload_id" not in columns:
+            connection.execute("ALTER TABLE recordings ADD COLUMN upload_id TEXT")
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS recordings_upload_id_idx "
+            "ON recordings(upload_id) WHERE upload_id IS NOT NULL"
         )
 
 
@@ -65,8 +76,18 @@ def create_recording(
     source: str,
     fileobj: BinaryIO,
     device_id: str | None = None,
+    upload_id: str | None = None,
 ) -> dict[str, Any]:
     init_db()
+    if upload_id:
+        with connect() as connection:
+            existing = connection.execute(
+                "SELECT id FROM recordings WHERE upload_id = ?",
+                (upload_id,),
+            ).fetchone()
+        if existing is not None:
+            return get_recording(existing["id"], include_result=False)
+
     suffix = validate_audio_filename(filename)
     recording_id = str(uuid.uuid4())
     upload_path = UPLOAD_DIR / f"{recording_id}{suffix}"
@@ -79,12 +100,12 @@ def create_recording(
         connection.execute(
             """
             INSERT INTO recordings (
-                id, device_id, original_filename, storage_path, status, source,
+                id, upload_id, device_id, original_filename, storage_path, status, source,
                 created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, 'uploaded', ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'uploaded', ?, ?, ?)
             """,
-            (recording_id, device_id, filename, str(upload_path), source, now, now),
+            (recording_id, upload_id, device_id, filename, str(upload_path), source, now, now),
         )
 
     return get_recording(recording_id, include_result=False)
@@ -96,7 +117,7 @@ def list_recordings() -> list[dict[str, Any]]:
         rows = connection.execute(
             """
             SELECT * FROM recordings
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, rowid DESC
             """
         ).fetchall()
     return [row_to_dict(row, include_result=False) for row in rows]
@@ -166,10 +187,10 @@ def update_recording(recording_id: str, **fields: Any) -> None:
         )
 
 
-def analyze_recording(recording_id: str) -> None:
+def analyze_recording(recording_id: str, force: bool = False) -> None:
     try:
         recording = get_recording(recording_id, include_result=False)
-        if recording["status"] == "processing":
+        if recording["status"] == "processing" or (recording["status"] == "complete" and not force):
             return
         mark_processing(recording_id)
         result = analyze_audio(Path(recording["storage_path"]), recording["original_filename"])

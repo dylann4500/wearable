@@ -1,14 +1,17 @@
 # BLE Phone Sync Pipeline
 
-This is the no-cloud MVP path:
+This is the phone-relay analysis path:
 
 ```text
 XIAO ESP32S3 records WAV to microSD
   -> iPhone finds XIAO over BLE
   -> iPhone starts/stops recording or lists existing SD recordings
   -> XIAO sends selected WAV in BLE chunks
-  -> iPhone stores the WAV locally
-  -> iPhone plays it back and can upload it later
+  -> iPhone validates and stores the WAV locally
+  -> iPhone queues a file-backed HTTPS upload
+  -> FastAPI creates an idempotent recording job
+  -> backend runs transcription, diarization, metrics, and insights
+  -> iPhone displays the completed scores and coaching evidence
 ```
 
 ## Firmware
@@ -77,6 +80,15 @@ Bluetooth does not work in the iOS Simulator for real hardware scanning. Use a p
 
 - Wi-Fi upload is disabled by default in `firmware_config.example.h` so BLE testing does not block on network credentials.
 - Files remain on the SD card after phone sync. The firmware writes a `.phone_synced` marker when the iPhone confirms download.
+- A verified local WAV emits a `CompletedWearableDownload`. `RecordingPipelineCoordinator`
+  persists and deduplicates the relay job by filename, byte size, and CRC32. If
+  the backend is disabled, the job remains in `Waiting for backend` state.
+- Phone relay uses `POST /api/device/recordings/raw?filename=...` with
+  `X-Device-Id`, `X-Device-Token`, and a stable `X-Upload-Id`. Repeating an
+  upload ID returns the existing recording job instead of analyzing a duplicate.
+- The coordinator serializes uploads and polls `GET /api/recordings/{id}` until
+  analysis is complete or failed. The Insights tab reads the real
+  `result.insights` and `result.interpretation` response rather than mock data.
 - New recordings are written to a `.recording` temporary path and renamed to
   `.wav` only after the final header is safely written. The manifest also
   rejects legacy incomplete WAVs left by an interrupted recording.

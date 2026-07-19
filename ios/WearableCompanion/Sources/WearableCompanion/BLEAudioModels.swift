@@ -18,6 +18,31 @@ struct WearableAudioRecording: Identifiable, Hashable {
     }
 }
 
+struct CompletedWearableDownload: Identifiable, Equatable {
+    let id: UUID
+    let filename: String
+    let byteSize: Int
+    let crc32: UInt32
+    let localFileURL: URL
+    let deviceID: String
+
+    init(
+        id: UUID = UUID(),
+        filename: String,
+        byteSize: Int,
+        crc32: UInt32,
+        localFileURL: URL,
+        deviceID: String
+    ) {
+        self.id = id
+        self.filename = filename
+        self.byteSize = byteSize
+        self.crc32 = crc32
+        self.localFileURL = localFileURL
+        self.deviceID = deviceID
+    }
+}
+
 enum WearableTransferState: Equatable {
     case onWearable
     case queued

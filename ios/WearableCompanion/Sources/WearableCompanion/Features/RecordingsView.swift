@@ -6,6 +6,7 @@ struct RecordingsView: View {
     @Environment(BackendClient.self) private var backend
     @Environment(WearableBLEManager.self) private var bleManager
     @Environment(AudioPlaybackController.self) private var playback
+    @Environment(RecordingPipelineCoordinator.self) private var recordingPipeline
 
     @State private var recordings: [Recording] = []
     @State private var selectedRecording: Recording?
@@ -94,6 +95,12 @@ struct RecordingsView: View {
                 await refresh()
             }
         }
+        .task(id: recordingPipeline.latestCompletedRecording?.id) {
+            if appState.isBackendEnabled,
+               recordingPipeline.latestCompletedRecording != nil {
+                await refresh()
+            }
+        }
         .refreshable {
             bleManager.refreshRecordings()
             if appState.isBackendEnabled {
@@ -170,6 +177,7 @@ struct RecordingsView: View {
 private struct DashboardWearableRecordingRow: View {
     @Environment(WearableBLEManager.self) private var bleManager
     @Environment(AudioPlaybackController.self) private var playback
+    @Environment(RecordingPipelineCoordinator.self) private var recordingPipeline
     var recording: WearableAudioRecording
 
     private var transferState: WearableTransferState {
@@ -211,6 +219,18 @@ private struct DashboardWearableRecordingRow: View {
             }
 
             if let localFileURL = recording.localFileURL {
+                if let relayStage = recordingPipeline.stage(for: localFileURL) {
+                    Label(relayStage.label, systemImage: relayIcon(relayStage))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(relayStage == .failed ? .red : .secondary)
+
+                    if let error = recordingPipeline.error(for: localFileURL) {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                }
+
                 Button {
                     playback.play(url: localFileURL)
                 } label: {
@@ -241,6 +261,17 @@ private struct DashboardWearableRecordingRow: View {
         case .queued, .downloading: .blue
         case .downloaded: .green
         case .failed: .red
+        }
+    }
+
+    private func relayIcon(_ stage: RelayPipelineStage) -> String {
+        switch stage {
+        case .waitingForBackend: "icloud.slash"
+        case .queued: "clock.arrow.circlepath"
+        case .uploading: "icloud.and.arrow.up"
+        case .processing: "brain.head.profile"
+        case .complete: "sparkles"
+        case .failed: "exclamationmark.icloud"
         }
     }
 }

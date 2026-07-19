@@ -25,7 +25,9 @@ enum AppTab: String, CaseIterable, Identifiable {
 
 struct AppView: View {
     @Environment(AppState.self) private var appState
+    @Environment(BackendClient.self) private var backend
     @Environment(WearableBLEManager.self) private var bleManager
+    @Environment(RecordingPipelineCoordinator.self) private var recordingPipeline
 
     var body: some View {
         @Bindable var appState = appState
@@ -58,5 +60,30 @@ struct AppView: View {
         .task {
             bleManager.startAutoSyncNearest()
         }
+        .task(id: bleManager.latestCompletedDownload?.id) {
+            guard let download = bleManager.latestCompletedDownload else { return }
+            recordingPipeline.enqueue(
+                download,
+                backendEnabled: appState.isBackendEnabled,
+                backend: backend,
+                deviceToken: appState.deviceUploadToken
+            )
+        }
+        .task(id: backendConfigurationID) {
+            recordingPipeline.resumeLocalRecordings(
+                bleManager.recordings,
+                backendEnabled: appState.isBackendEnabled,
+                backend: backend,
+                deviceToken: appState.deviceUploadToken
+            )
+        }
+        .task(id: recordingPipeline.latestCompletedRecording?.id) {
+            guard let completed = recordingPipeline.latestCompletedRecording else { return }
+            appState.selectedRecordingID = completed.id
+        }
+    }
+
+    private var backendConfigurationID: String {
+        "\(appState.isBackendEnabled)|\(backend.baseURL.absoluteString)|\(appState.deviceUploadToken)"
     }
 }

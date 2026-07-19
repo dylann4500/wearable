@@ -106,6 +106,7 @@ async def upload_device_recording(
     file: UploadFile = File(...),
     x_device_id: str | None = Header(default=None),
     x_device_token: str | None = Header(default=None),
+    x_upload_id: str | None = Header(default=None),
 ) -> dict:
     expected_token = os.getenv("DEVICE_UPLOAD_TOKEN", "dev-device-token")
     if x_device_token != expected_token:
@@ -120,6 +121,7 @@ async def upload_device_recording(
             filename=file.filename,
             source="device",
             device_id=x_device_id,
+            upload_id=x_upload_id,
             fileobj=file.file,
         )
     except ValueError as exc:
@@ -138,6 +140,7 @@ async def upload_raw_device_recording(
     filename: str = Query(...),
     x_device_id: str | None = Header(default=None),
     x_device_token: str | None = Header(default=None),
+    x_upload_id: str | None = Header(default=None),
 ) -> dict:
     expected_token = os.getenv("DEVICE_UPLOAD_TOKEN", "dev-device-token")
     if x_device_token != expected_token:
@@ -155,6 +158,7 @@ async def upload_raw_device_recording(
                 filename=filename,
                 source="device",
                 device_id=x_device_id,
+                upload_id=x_upload_id,
                 fileobj=temp_file,
             )
     except ValueError as exc:
@@ -176,7 +180,7 @@ def analyze_existing_recording(recording_id: str, background_tasks: BackgroundTa
     if recording["status"] == "processing":
         return recording
 
-    background_tasks.add_task(analyze_recording, recording_id)
+    background_tasks.add_task(analyze_recording, recording_id, True)
     return recording
 
 

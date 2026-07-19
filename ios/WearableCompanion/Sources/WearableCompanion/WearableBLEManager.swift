@@ -49,6 +49,7 @@ final class WearableBLEManager: NSObject {
     var downloadProgress: [String: Double] = [:]
     var autoSyncNearestEnabled = true
     var isAutoSyncing = false
+    var latestCompletedDownload: CompletedWearableDownload?
 
     override init() {
         super.init()
@@ -554,6 +555,15 @@ final class WearableBLEManager: NSObject {
         downloadProgress[activeDownload.filename] = 1
         downloadRetryCounts[activeDownload.filename] = nil
         terminalDownloadFailures.remove(activeDownload.filename)
+        latestCompletedDownload = CompletedWearableDownload(
+            filename: activeDownload.filename,
+            byteSize: activeDownload.totalBytes,
+            crc32: activeDownload.expectedCRC32,
+            localFileURL: activeDownload.finalFileURL,
+            deviceID: connectedPeripheral.map {
+                "xiao-\($0.identifier.uuidString.lowercased())"
+            } ?? "xiao-ios-relay"
+        )
         writeCommand("MARK_SYNCED:\(activeDownload.filename)")
         self.activeDownload = nil
         startNextDownloadIfNeeded()
@@ -1019,6 +1029,7 @@ final class WearableBLEManager {
     var downloadProgress: [String: Double] = [:]
     var autoSyncNearestEnabled = true
     var isAutoSyncing = false
+    var latestCompletedDownload: CompletedWearableDownload?
 
     func startScan() {}
     func stopScan() {}

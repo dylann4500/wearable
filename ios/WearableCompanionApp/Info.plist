@@ -26,6 +26,13 @@
 	<true/>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Wearable Companion uses Bluetooth to find the XIAO wearable, start and stop recordings, and download saved audio.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Wearable Companion connects to your development backend on the local network to upload recordings and retrieve conversation insights.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

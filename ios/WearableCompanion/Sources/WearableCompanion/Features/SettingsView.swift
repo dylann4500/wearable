@@ -33,13 +33,13 @@ struct SettingsView: View {
             }
 
             Section("Device security") {
-                Picker("Upload token", selection: $appState.uploadTokenStatus) {
-                    ForEach(UploadTokenStatus.allCases) { status in
-                        Text(status.rawValue).tag(status)
-                    }
-                }
+                SecureField("Device upload token", text: $appState.deviceUploadToken)
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
 
-                Text("The current FastAPI backend accepts a shared `X-Device-Token`. Production pairing should mint per-device scoped tokens and support rotation or revocation from this screen.")
+                Text("The phone relay uses this as `X-Device-Token` when it sends a verified wearable WAV to the backend. The development backend defaults to `dev-device-token`.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -60,6 +60,7 @@ struct SettingsView: View {
         guard let url = URL(string: backendURLText), url.scheme != nil else { return }
         appState.backendBaseURL = url
         backend.baseURL = url
+        appState.isBackendEnabled = true
     }
 }
 

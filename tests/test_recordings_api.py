@@ -108,6 +108,31 @@ class RecordingApiTest(unittest.TestCase):
         self.assertEqual(payload["device_id"], "test-device")
         self.assertEqual(payload["status"], "complete")
         self.assertEqual(payload["result"]["metadata"]["file_name"], "audio0001.wav")
+        self.assertIn("insights", payload["result"])
+
+    def test_device_raw_upload_is_idempotent(self) -> None:
+        headers = {
+            "X-Device-Id": "test-device",
+            "X-Device-Token": "test-token",
+            "X-Upload-Id": "verified-wav-123",
+            "Content-Type": "application/octet-stream",
+        }
+
+        first = self.client.post(
+            "/api/device/recordings/raw?filename=audio0001.wav",
+            content=tiny_wav_bytes(),
+            headers=headers,
+        )
+        second = self.client.post(
+            "/api/device/recordings/raw?filename=audio0001.wav",
+            content=tiny_wav_bytes(),
+            headers=headers,
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["id"], second.json()["id"])
+        self.assertEqual(len(self.client.get("/api/recordings").json()), 1)
 
     def test_browser_upload_uses_same_job_pipeline(self) -> None:
         response = self.client.post(

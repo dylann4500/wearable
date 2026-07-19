@@ -5,11 +5,12 @@ import Observation
 @Observable
 final class AppState {
     var selectedTab: AppTab = .recordings
-    var backendBaseURL = URL(string: "http://127.0.0.1:8000")!
-    var isBackendEnabled = false
+    var backendBaseURL = URL(string: "http://192.168.4.97:8000")!
+    var isBackendEnabled = true
     var selectedRecordingID: Recording.ID?
     var pairingMode: PairingMode = .bluetoothProvisioning
     var uploadTokenStatus: UploadTokenStatus = .developmentToken
+    var deviceUploadToken = "dev-device-token"
 }
 
 enum UploadTokenStatus: String, CaseIterable, Identifiable {

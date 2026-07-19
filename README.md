@@ -209,6 +209,10 @@ X-Device-Id: xiao-esp32s3-prototype-001
 X-Device-Token: dev-device-token
 ```
 
+Phone relays also send a stable `X-Upload-Id` derived from the verified WAV.
+The backend uses it as an idempotency key, so reconnects and app relaunches do
+not create duplicate analysis jobs.
+
 ### Test Without Hardware
 
 Run the app, then simulate the wearable upload from your laptop:
